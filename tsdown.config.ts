@@ -9,15 +9,17 @@ export default defineConfig([
         outDir: 'dist',
         sourcemap: true,
         clean: false,
-        dts: { generator: 'oxc' },   // isolatedDeclarations: no TypeScript JS API involved
+        dts: { generator: 'oxc' },
+        treeshake: { manualPureFunctions: ['test', 'describe'] },
     },
     {
         // <script>-tag build, starts itself
-        entry: { 'x-attributes': 'src/iife.ts' },
+        entry: { 'x-attributes': './src/iife.ts' },
         format: 'iife',
         platform: 'browser',
         outDir: 'dist',
         minify: true,
+        treeshake: { manualPureFunctions: ['test', 'describe'] },
         clean: false,
         dts: false,
     },

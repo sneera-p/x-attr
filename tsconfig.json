@@ -1,17 +1,25 @@
 {
-  "compilerOptions": {
-    "target": "ES2022",
-    "module": "ESNext",
-    "moduleResolution": "bundler",
-    "lib": ["ES2022", "DOM", "DOM.Iterable"],
-    "strict": true,
-    "noUncheckedIndexedAccess": true,
-    "isolatedModules": true,
-    "verbatimModuleSyntax": true,
-    "skipLibCheck": true,
-    "isolatedDeclarations": true,
-    "declaration": true,
-    "noEmit": true
-  },
-  "include": ["src", "test"]
+   "compilerOptions": {
+      "target": "ES2022",
+      "module": "ESNext",
+      "moduleResolution": "bundler",
+      "lib": [
+         "ES2022",
+         "DOM",
+         "DOM.Iterable"
+      ],
+      "strict": true,
+      "noUncheckedIndexedAccess": true,
+      "isolatedModules": true,
+      "verbatimModuleSyntax": true,
+      "skipLibCheck": true,
+      "isolatedDeclarations": true,
+      "declaration": true,
+      "noEmit": true,
+      "types": []
+   },
+   "include": [
+      "src",
+      "test"
+   ]
 }

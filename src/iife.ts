@@ -1,17 +1,19 @@
 // Entry for the <script>-tag build only. The ESM build (index.ts) never runs on import;
 // this one starts itself, because a script tag has no other place to call start().
-import { processNode, start } from './index';
+import { process } from './index';
+
+const XATTR: unique symbol = Symbol('sneera:x-attr:process');
 
 declare global {
     interface Window {
-        x: { start: typeof start; processNode: typeof processNode };
+        [XATTR]: typeof process;
     }
 }
 
-window.x = { start, processNode };
+window[XATTR] = process;
 
 if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', () => start());
+    document.addEventListener('DOMContentLoaded', () => process(document.body));
 } else {
-    start();
+    process(document.body);
 }

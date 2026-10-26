@@ -11,6 +11,8 @@ export enum Modifiers {
     TRIGGER = 'x-trigger',
     TARGET = 'x-target',
     SWAP = 'x-swap',
+    INCLUDE = 'x-include',
+    VALS = 'x-vals',
 }
 
 type ArrayOrSingle<T> = T | T[];

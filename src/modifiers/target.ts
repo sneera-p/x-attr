@@ -1,17 +1,3 @@
-import { Modifiers } from "./attrs";
-import { defaultSwap, defaultTrigger } from "./defaults";
-import type { Tag } from "./tag";
-
-export function resolveTrigger(el: Element): string {
-    return el.getAttribute(Modifiers.TRIGGER)
-        ?? defaultTrigger[el.localName as Tag];
-}
-
-export function resolveSwap(el: Element): string {
-    return el.getAttribute(Modifiers.SWAP)
-        ?? defaultSwap[el.localName as Tag];
-}
-
 /**
  * Finds the element a response should be swapped into.
  *
