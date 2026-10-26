@@ -4,11 +4,6 @@ import { resolveSwap, swap } from '../modifiers/swap';
 import { resolveTrigger } from '../modifiers/trigger';
 import { collectValues } from '../shared/values';
 
-/** Navigates the whole page. A variable so the tests can replace it. */
-let navigate = (url: string): void => {
-    location.assign(url);
-};
-
 /**
  * Wires an x-get element: on its trigger, fetch the URL (with the element's values
  * as a query string) and swap the response in.
@@ -65,7 +60,7 @@ export function get(node: Element, reprocess: (node: Node) => void): void {
 
         const redirect = response.headers.get('X-Redirect');
         if (redirect !== null) {
-            navigate(redirect);
+            location.assign(redirect);
             return;
         }
 
@@ -173,18 +168,7 @@ function emit(el: Element, name: string, detail: object): void {
 // ---- tests (removed from the build) ----
 
 describe('get', () => {
-    // fetch and settle come from test/setup.ts; navigate is this module's, so it's replaced here
-    const realNavigate = navigate;
-    let navigated: string[] = [];   // every URL passed to navigate()
-
-    beforeEach(() => {
-        navigated = [];
-        navigate = url => { navigated.push(url); };
-    });
-
-    afterEach(() => {
-        navigate = realNavigate;
-    });
+    // fetch, location.assign and settle are faked in test/setup.ts
 
     /** Renders `html`, wires the element matching `selector`, returns it and the nodes it reprocessed. */
     function wire(html: string, selector: string) {
@@ -309,7 +293,7 @@ describe('get', () => {
             el.click();
             await settle();
 
-            expect(navigated).toEqual(['/staff/login']);
+            expect(page.navigated).toEqual(['/staff/login']);
             expect(out()).toBe('untouched');
             expect(reprocessed).toEqual([]);
         });

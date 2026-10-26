@@ -73,7 +73,15 @@ const viewport: FakeViewport = {
 
 globalThis.IntersectionObserver = FakeIntersectionObserver as unknown as typeof IntersectionObserver;
 
-Object.assign(globalThis, { server, settle, viewport });
+/**
+ * Fake page navigation: location.assign / location.reload record instead of leaving the page.
+ * (Real browsers don't allow replacing these; happy-dom does, and only tests ever see it.)
+ */
+const page: FakePage = { navigated: [], reloads: 0 };
+location.assign = (url: string | URL) => { page.navigated.push(String(url)); };
+location.reload = () => { page.reloads++; };
+
+Object.assign(globalThis, { server, settle, viewport, page });
 
 // Runs before every test in every file: a clean page and a clean server.
 beforeEach(() => {
@@ -81,4 +89,6 @@ beforeEach(() => {
     server.routes = {};
     server.requested = [];
     for (const o of [...observers]) o.disconnect();
+    page.navigated = [];
+    page.reloads = 0;
 });

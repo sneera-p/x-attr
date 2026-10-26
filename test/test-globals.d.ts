@@ -39,6 +39,15 @@ declare global {
         isObserved(el: Element): boolean;
     }
     const viewport: FakeViewport;
+
+    /** What location.assign / location.reload were asked to do (faked in test/setup.ts). Reset before every test. */
+    interface FakePage {
+        /** Every URL passed to location.assign, in order. */
+        navigated: string[];
+        /** How many times location.reload was called. */
+        reloads: number;
+    }
+    const page: FakePage;
     /** Waits for timers and pending fetches; `ms` covers delayed routes and debounces. */
     const settle: (ms?: number) => Promise<void>;
 }
