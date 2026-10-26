@@ -19,6 +19,7 @@ let navigate = (url: string): void => {
  * - `X-Redirect: <url>` on the response navigates the page instead of swapping.
  * - Non-2xx responses dispatch `x:responseError`; network failures `x:sendError`.
  *   Both bubble from the element, so one listener on document can handle all of them.
+ * - x-trigger="revealed" fires once, when the element first scrolls into view.
  */
 export function get(node: Element, reprocess: (node: Node) => void): void {
     const url = node.getAttribute(Verbs.GET);
@@ -33,6 +34,7 @@ export function get(node: Element, reprocess: (node: Node) => void): void {
         if (inflight) {
             inflight.abort();
         }
+
         const controller = new AbortController();
         inflight = controller;
 
@@ -51,7 +53,7 @@ export function get(node: Element, reprocess: (node: Node) => void): void {
             }
             emit(node, 'x:sendError', { 
                 url: requestUrl, 
-                error: error 
+                error: error
             });
             return;
         }
@@ -103,7 +105,7 @@ export function get(node: Element, reprocess: (node: Node) => void): void {
                 if (trigger.event === 'submit' || node.matches('a') || isSubmitButton(node)) {
                     e.preventDefault();
                 }
-                
+
                 if (trigger.delay === 0) {
                     void fire();
                 } else {
@@ -112,6 +114,28 @@ export function get(node: Element, reprocess: (node: Node) => void): void {
                 }
             });
             return;
+        }
+
+        case 'revealed': {
+            // fires once, the first time the element is in view (immediately, if it already is)
+            const observer = new IntersectionObserver(entries => {
+                if (!node.isConnected) {
+                    observer.disconnect();   // removed before it was ever revealed
+                    return;
+                }
+                if (entries.some(entry => entry.isIntersecting)) {
+                    observer.disconnect();
+                    void fire();
+                }
+            });
+            observer.observe(node);
+            return;
+        }
+
+        default: {
+            // a new Trigger kind without a case here is a compile error, not a silent no-op
+            const unhandled: never = trigger;
+            throw new Error(`Unhandled trigger: ${JSON.stringify(unhandled)}`);
         }
     }
 }
@@ -423,6 +447,70 @@ describe('get', () => {
 
             expect(whileOnPage).toBeGreaterThanOrEqual(2);
             expect(server.requested.length).toBe(whileOnPage);
+        });
+    });
+
+    describe('revealed', () => {
+        test('sends nothing until the element is in view', async () => {
+            wire('<div x-get="/more" x-trigger="revealed">…</div>', 'div');
+            await settle();
+
+            expect(server.requested).toEqual([]);
+        });
+
+        test('sends once when revealed', async () => {
+            server.routes['/more'] = 'loaded';
+            const { el } = wire('<div x-get="/more" x-trigger="revealed">…</div>', 'div');
+
+            viewport.reveal(el);
+            await settle();
+
+            expect(server.requested).toEqual(['/more']);
+            expect(el.innerHTML).toBe('loaded');
+        });
+
+        test('fires only once, even if scrolled out and back in', async () => {
+            server.routes['/more'] = 'loaded';
+            const { el } = wire('<div x-get="/more" x-trigger="revealed">…</div>', 'div');
+
+            viewport.reveal(el);
+            viewport.hide(el);
+            viewport.reveal(el);
+            await settle();
+
+            expect(server.requested).toEqual(['/more']);
+            expect(viewport.isObserved(el)).toBe(false);
+        });
+
+        test('scrolling out of view without being revealed does nothing', async () => {
+            const { el } = wire('<div x-get="/more" x-trigger="revealed">…</div>', 'div');
+
+            viewport.hide(el);
+            await settle();
+
+            expect(server.requested).toEqual([]);
+            expect(viewport.isObserved(el)).toBe(true);
+        });
+
+        test('an element removed before it was revealed stops being observed and never sends', async () => {
+            const { el } = wire('<div id="wrap"><div id="s" x-get="/more" x-trigger="revealed">…</div></div>', '#s');
+
+            document.getElementById('wrap')!.remove();
+            viewport.hide(el);      // the browser reports a removed element as no longer intersecting
+            viewport.reveal(el);
+            await settle();
+
+            expect(server.requested).toEqual([]);
+            expect(viewport.isObserved(el)).toBe(false);
+        });
+
+        test('sends values like any x-get (e.g. a cursor in x-vals)', async () => {
+            const { el } = wire(`<div x-get="/jobs" x-vals='{"before":"40"}' x-trigger="revealed"></div>`, 'div');
+
+            viewport.reveal(el);
+            await settle();
+
+            expect(server.requested).toEqual(['/jobs?before=40']);
         });
     });
 });

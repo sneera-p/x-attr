@@ -28,6 +28,17 @@ declare global {
     }
 
     const server: FakeServer;
+
+    /** Controls the fake IntersectionObserver (test/setup.ts). Nothing is visible until revealed. */
+    interface FakeViewport {
+        /** Scrolls `el` into view: every observer watching it is called with isIntersecting = true. */
+        reveal(el: Element): void;
+        /** Scrolls `el` out of view: observers are called with isIntersecting = false. */
+        hide(el: Element): void;
+        /** Whether any observer is still watching `el`. */
+        isObserved(el: Element): boolean;
+    }
+    const viewport: FakeViewport;
     /** Waits for timers and pending fetches; `ms` covers delayed routes and debounces. */
     const settle: (ms?: number) => Promise<void>;
 }

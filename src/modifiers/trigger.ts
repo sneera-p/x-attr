@@ -23,8 +23,7 @@ export type Trigger =
     | { kind: 'event'; event: string; delay: number }
     | { kind: 'every'; interval: number }
     | { kind: 'load' }
-    | { kind: 'revealed' }
-    | { kind: 'sse'; event: string; };
+    | { kind: 'revealed' };
 
 /** Inputs that are clicked, not changed. */
 const CLICKED_INPUTS = new Set(['submit', 'button', 'reset', 'image']);
@@ -69,6 +68,13 @@ export function resolveTrigger(el: Element): Trigger {
                 kind: 'load' 
             };
 
+        case 'revealed':
+            if (rest.length > 0) {
+                throw new Error(`x-trigger "revealed" takes no modifiers: ${value}`);
+            }
+            return { kind: 'revealed' };
+
+
         case 'every':
             if (rest.length !== 1) {
                 throw new Error(`x-trigger "every" needs exactly one duration, e.g. "every 5s": ${value}`);
@@ -111,7 +117,7 @@ describe('resolveTrigger', () => {
         document.body.innerHTML = html;
         return document.body.firstElementChild!;
     };
-
+ 
     describe('defaults', () => {
         test('form → submit', () => {
             expect(resolveTrigger(on('<form></form>'))).toEqual({ kind: 'event', event: 'submit', delay: 0 });
@@ -131,7 +137,7 @@ describe('resolveTrigger', () => {
             expect(resolveTrigger(on('<job-card></job-card>'))).toEqual({ kind: 'event', event: 'click', delay: 0 });
         });
     });
-
+ 
     describe('x-trigger values', () => {
         test('a plain event', () => {
             expect(resolveTrigger(on('<input x-trigger="keyup">'))).toEqual({ kind: 'event', event: 'keyup', delay: 0 });
@@ -147,12 +153,15 @@ describe('resolveTrigger', () => {
             expect(resolveTrigger(on('<div x-trigger="every 5s"></div>'))).toEqual({ kind: 'every', interval: 5000 });
             expect(resolveTrigger(on('<div x-trigger="every 250ms"></div>'))).toEqual({ kind: 'every', interval: 250 });
         });
+        test('revealed', () => {
+            expect(resolveTrigger(on('<div x-trigger="revealed"></div>'))).toEqual({ kind: 'revealed' });
+        });
         test('is not inherited from ancestors', () => {
             document.body.innerHTML = '<form x-trigger="keyup"><button>b</button></form>';
             expect(resolveTrigger(document.querySelector('button')!)).toEqual({ kind: 'event', event: 'click', delay: 0 });
         });
     });
-
+ 
     describe('invalid values throw', () => {
         const invalid = [
             ['', /empty/],
@@ -164,6 +173,7 @@ describe('resolveTrigger', () => {
             ['every', /every/],
             ['every 5', /duration/],
             ['every 1s 2s', /every/],
+            ['revealed delay:1s', /revealed/],
         ] as const;
         for (const [value, message] of invalid) {
             test(JSON.stringify(value), () => {

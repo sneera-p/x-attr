@@ -35,11 +35,50 @@ globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) =>
 /** Waits for timers and pending fetches; `ms` covers delayed routes and debounces. */
 const settle = (ms = 0): Promise<void> => new Promise(resolve => setTimeout(resolve, ms + 5));
 
-Object.assign(globalThis, { server, settle });
+/**
+ * Fake IntersectionObserver: nothing is ever "visible" until a test says so.
+ * viewport.reveal(el) / viewport.hide(el) call every observer watching `el`,
+ * the same way the browser does when it scrolls in or out of view.
+ */
+class FakeIntersectionObserver {
+    readonly root = null;
+    readonly rootMargin = '0px';
+    readonly thresholds = [0];
+    readonly targets = new Set<Element>();
+
+    constructor(private readonly callback: IntersectionObserverCallback) {
+        observers.add(this);
+    }
+    observe(el: Element): void { this.targets.add(el); }
+    unobserve(el: Element): void { this.targets.delete(el); }
+    disconnect(): void { this.targets.clear(); observers.delete(this); }
+    takeRecords(): IntersectionObserverEntry[] { return []; }
+
+    notify(el: Element, isIntersecting: boolean): void {
+        if (!this.targets.has(el)) {
+            return;
+        }
+        const entry = { target: el, isIntersecting, intersectionRatio: isIntersecting ? 1 : 0 } as IntersectionObserverEntry;
+        this.callback([entry], this as unknown as IntersectionObserver);
+    }
+}
+
+const observers = new Set<FakeIntersectionObserver>();
+
+const viewport: FakeViewport = {
+    reveal: el => { for (const o of [...observers]) o.notify(el, true); },
+    hide: el => { for (const o of [...observers]) o.notify(el, false); },
+    isObserved: el => [...observers].some(o => o.targets.has(el)),
+};
+
+globalThis.IntersectionObserver = FakeIntersectionObserver as unknown as typeof IntersectionObserver;
+
+Object.assign(globalThis, { server, settle, viewport });
 
 // Runs before every test in every file: a clean page and a clean server.
 beforeEach(() => {
     document.body.innerHTML = '';
     server.routes = {};
     server.requested = [];
+    for (const o of [...observers]) o.disconnect();
 });
