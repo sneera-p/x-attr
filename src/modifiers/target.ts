@@ -1,3 +1,5 @@
+import { Modifiers } from "../shared/attrs";
+
 /**
  * Finds the element a response should be swapped into.
  *
@@ -8,12 +10,12 @@
  * @throws Error when the value is malformed or matches nothing
  */
 export function resolveTarget(el: Element): Element {
-    const owner = el.closest('[x-target]');
+    const owner = el.closest(`[${Modifiers.TARGET}]`);
     if (owner === null) {
         return el;
     }
 
-    const value = owner.getAttribute('x-target')!.trim();
+    const value = owner.getAttribute(Modifiers.TARGET)!.trim();
     const space = value.indexOf(' ');
     const keyword = space === -1 ? value : value.slice(0, space);
     const selector = space === -1 ? '' : value.slice(space + 1).trim();

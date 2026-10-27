@@ -14,22 +14,3 @@ export enum Modifiers {
     INCLUDE = 'x-include',
     VALS = 'x-vals',
 }
-
-type ArrayOrSingle<T> = T | T[];
-
-export namespace Attributes {
-    export function map(attrs: ArrayOrSingle<Verbs> | ArrayOrSingle<Modifiers>): string {
-        const v = Array.isArray(attrs) ? attrs : [attrs];
-        return v
-            .map(v => `[${v}]`)
-            .join(',');
-    }
-
-    export function inElement(node: Element, attrs: ArrayOrSingle<Verbs> | ArrayOrSingle<Modifiers>): boolean {
-        const v = Array.isArray(attrs) ? attrs : [attrs];
-        return v.reduce<boolean>(
-            (acc, v) => acc && node.hasAttribute(`${v}`), 
-            true
-        );
-    }
-}

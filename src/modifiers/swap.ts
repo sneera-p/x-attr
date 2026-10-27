@@ -1,4 +1,5 @@
 import { Modifiers } from "../shared/attrs";
+import { cleanup } from "../shared/cleanup";
 import type { ElementTag } from "../shared/tag";
 
 const baseDefaultSwap: string = 'innerHTML';
@@ -51,6 +52,7 @@ export function swap(target: Element, mode: string, html: string): Node[] {
         return [];
     }
     if (mode === 'delete') {
+        cleanup(target);
         target.remove();
         return [];
     }
@@ -61,9 +63,12 @@ export function swap(target: Element, mode: string, html: string): Node[] {
 
     switch (mode) {
         case 'innerHTML':
+            for (const child of [...target.children])
+                cleanup(child);
             target.replaceChildren(template.content);
             break;
         case 'outerHTML':
+            cleanup(target);
             target.replaceWith(template.content);
             break;
         case 'beforebegin':

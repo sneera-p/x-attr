@@ -16,14 +16,14 @@ const defaultTrigger: Partial<Record<ElementTag, string>> = {
 };
 
 
-type Tag = keyof HTMLElementTagNameMap;
-
 /** When a request fires: on a DOM event (optionally debounced), once on load, or on a timer. */
 export type Trigger =
-    | { kind: 'event'; event: string; delay: number }
-    | { kind: 'every'; interval: number }
     | { kind: 'load' }
-    | { kind: 'revealed' };
+    | { kind: 'revealed' }
+    | { kind: 'sse'; event: string }
+    | { kind: 'every'; interval: number }
+    | { kind: 'event'; event: string; delay: number }
+;
 
 /** Inputs that are clicked, not changed. */
 const CLICKED_INPUTS = new Set(['submit', 'button', 'reset', 'image']);
@@ -35,6 +35,7 @@ const CLICKED_INPUTS = new Set(['submit', 'button', 'reset', 'image']);
  *   "keyup"                → that event
  *   "keyup delay:300ms"    → that event, debounced: fires once events stop for 300 ms
  *   "load"                 → once, as soon as the element is processed
+ *   "revealed"             → once, as the element is revealed to the window
  *   "every 5s"             → repeatedly, every 5 seconds, while the element is on the page
  *   "sse staff:update:2"   → SSE, subscribe to 'staff:update:2' event
  *
@@ -49,7 +50,7 @@ export function resolveTrigger(el: Element): Trigger {
             kind: 'event',
             event: (el instanceof HTMLInputElement && CLICKED_INPUTS.has(el.type))
                 ? baseDefaultTrigger
-                : defaultTrigger[el.localName as Tag] ?? baseDefaultTrigger,
+                : defaultTrigger[el.localName as ElementTag] ?? baseDefaultTrigger,
             delay: 0
         };
     }
@@ -73,6 +74,12 @@ export function resolveTrigger(el: Element): Trigger {
                 throw new Error(`x-trigger "revealed" takes no modifiers: ${value}`);
             }
             return { kind: 'revealed' };
+
+        case 'sse':
+            if (rest.length !== 1) {
+                throw new Error(`x-trigger "sse" needs exactly one event name, e.g. "sse job:update": ${value}`);
+            }
+            return { kind: 'sse', event: rest[0]! };
 
 
         case 'every':
@@ -180,5 +187,21 @@ describe('resolveTrigger', () => {
                 expect(() => resolveTrigger(on(`<div x-trigger="${value}"></div>`))).toThrow(message);
             });
         }
+    });
+
+    describe('sse', () => {
+        const parse = (value: string): Trigger => {
+            document.body.innerHTML = `<div x-trigger="${value}"></div>`;
+            return resolveTrigger(document.querySelector('div')!);
+        };
+        test('"sse <event>" takes the event name, colons included', () => {
+            expect(parse('sse job:update:1')).toEqual({ kind: 'sse', event: 'job:update:1' });
+            expect(parse('  sse   a  ')).toEqual({ kind: 'sse', event: 'a' });
+        });
+        test('no name, two names or a modifier throws', () => {
+            expect(() => parse('sse')).toThrow(/exactly one/);
+            expect(() => parse('sse a b')).toThrow(/exactly one/);
+            expect(() => parse('sse a delay:1s')).toThrow(/exactly one/);
+        });
     });
 });

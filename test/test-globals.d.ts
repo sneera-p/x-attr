@@ -17,7 +17,24 @@ declare global {
         delay?: number;
         /** Fail like a network error (fetch rejects with TypeError). */
         fail?: true;
+        /** Respond with an open stream; push into it via server.streams. */
+        stream?: true;
     };
+
+    /** One open streamed response (a route with `stream: true`). */
+    interface FakeStream {
+        url: string;
+        /** The Last-Event-ID request header, or null. */
+        lastEventId: string | null;
+        /** True once ended, failed or aborted by the client. */
+        closed: boolean;
+        /** Pushes raw SSE text to the client. */
+        send(text: string): void;
+        /** Server closes the stream cleanly. */
+        end(): void;
+        /** Connection breaks mid-stream. */
+        fail(): void;
+    }
 
     /** The fake server behind fetch in tests (test/setup.ts). Reset before every test. */
     interface FakeServer {
@@ -25,6 +42,8 @@ declare global {
         routes: Record<string, FakeRoute>;
         /** Every URL fetched, in order. */
         requested: string[];
+        /** Every stream opened, in order. */
+        streams: FakeStream[];
     }
 
     const server: FakeServer;

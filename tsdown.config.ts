@@ -8,19 +8,9 @@ export default defineConfig([
         platform: 'browser',
         outDir: 'dist',
         sourcemap: true,
-        clean: false,
+        clean: true,
+        minify: true,
         dts: { generator: 'oxc' },
         treeshake: { manualPureFunctions: ['test', 'describe'] },
-    },
-    {
-        // <script>-tag build, starts itself
-        entry: { 'x-attributes': './src/iife.ts' },
-        format: 'iife',
-        platform: 'browser',
-        outDir: 'dist',
-        minify: true,
-        treeshake: { manualPureFunctions: ['test', 'describe'] },
-        clean: false,
-        dts: false,
     },
 ]);

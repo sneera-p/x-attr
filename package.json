@@ -14,7 +14,7 @@
   "files": [
     "dist"
   ],
-  "sideEffects": false,
+  "sideEffects": true,
   "scripts": {
     "build": "rm -rf dist && tsdown",
     "typecheck": "tsc -b",

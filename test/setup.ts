@@ -8,7 +8,7 @@ GlobalRegistrator.register({ url: 'http://localhost/' });
  * A route is HTML (status 200), or a spec for anything else. Unknown URLs → 404.
  * Requests honour AbortSignal like the real fetch: an aborted request rejects with AbortError.
  */
-const server: FakeServer = { routes: {}, requested: [] };
+const server: FakeServer = { routes: {}, requested: [], streams: [] };
 
 globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
     const url = String(input);
@@ -29,8 +29,31 @@ globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) =>
     if (spec.fail) {
         throw new TypeError('Failed to fetch');
     }
+    if (spec.stream) {
+        return openStream(url, init, spec);
+    }
     return new Response(spec.body ?? '', { status: spec.status ?? 200, headers: spec.headers });
 }) as typeof fetch;
+
+/** A streamed response the test pushes text into (server.streams). Abort closes it like a real fetch. */
+function openStream(url: string, init: RequestInit | undefined, spec: { status?: number; headers?: Record<string, string> }): Response {
+    let controller!: ReadableStreamDefaultController<Uint8Array>;
+    const encoder = new TextEncoder();
+    const stream: FakeStream = {
+        url,
+        lastEventId: new Headers(init?.headers).get('Last-Event-ID'),
+        closed: false,
+        send: text => { if (!stream.closed) controller.enqueue(encoder.encode(text)); },
+        end: () => { if (!stream.closed) { stream.closed = true; controller.close(); } },
+        fail: () => { if (!stream.closed) { stream.closed = true; controller.error(new TypeError('network error')); } },
+    };
+    const body = new ReadableStream<Uint8Array>({ start: c => { controller = c; } });
+    init?.signal?.addEventListener('abort', () => {
+        if (!stream.closed) { stream.closed = true; controller.error(new DOMException('aborted', 'AbortError')); }
+    });
+    server.streams.push(stream);
+    return new Response(body, { status: spec.status ?? 200, headers: spec.headers });
+}
 
 /** Waits for timers and pending fetches; `ms` covers delayed routes and debounces. */
 const settle = (ms = 0): Promise<void> => new Promise(resolve => setTimeout(resolve, ms + 5));
@@ -87,7 +110,9 @@ Object.assign(globalThis, { server, settle, viewport, page });
 beforeEach(() => {
     document.body.innerHTML = '';
     server.routes = {};
+    for (const s of server.streams) s.end();
     server.requested = [];
+    server.streams = [];
     for (const o of [...observers]) o.disconnect();
     page.navigated = [];
     page.reloads = 0;

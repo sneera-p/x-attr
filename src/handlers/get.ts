@@ -3,6 +3,8 @@ import { resolveTarget } from '../modifiers/target';
 import { resolveSwap, swap } from '../modifiers/swap';
 import { resolveTrigger } from '../modifiers/trigger';
 import { collectValues } from '../shared/values';
+import { subscribe } from '../sse/channel';
+import { onCleanup } from '../shared/cleanup';
 
 /**
  * Wires an x-get element: on its trigger, fetch the URL (with the element's values
@@ -10,10 +12,14 @@ import { collectValues } from '../shared/values';
  *
  * - `reprocess` is called for every inserted node, so x-* elements in the response
  *   become live. It's passed in (not imported) to avoid a process.ts ↔ get.ts cycle.
+ * 
  * - Latest request wins: a new request aborts this element's previous one.
+ * 
  * - `X-Redirect: <url>` on the response navigates the page instead of swapping.
+ * 
  * - Non-2xx responses dispatch `x:responseError`; network failures `x:sendError`.
  *   Both bubble from the element, so one listener on document can handle all of them.
+ * 
  * - x-trigger="revealed" fires once, when the element first scrolls into view.
  */
 export function get(node: Element, reprocess: (node: Node) => void): void {
@@ -24,6 +30,10 @@ export function get(node: Element, reprocess: (node: Node) => void): void {
 
     const trigger = resolveTrigger(node);
     let inflight: AbortController | undefined;
+    onCleanup(node, () => {
+        if (inflight)
+            inflight.abort();
+    });
 
     const fire = async (): Promise<void> => {
         if (inflight) {
@@ -46,8 +56,8 @@ export function get(node: Element, reprocess: (node: Node) => void): void {
             if (controller.signal.aborted) {
                 return;   // replaced by a newer request: not an error
             }
-            emit(node, 'x:sendError', { 
-                url: requestUrl, 
+            emit(node, 'x:sendError', {
+                url: requestUrl,
                 error: error
             });
             return;
@@ -65,9 +75,9 @@ export function get(node: Element, reprocess: (node: Node) => void): void {
         }
 
         if (!response.ok) {
-            emit(node, 'x:responseError', { 
-                url: requestUrl, 
-                status: response.status 
+            emit(node, 'x:responseError', {
+                url: requestUrl,
+                status: response.status
             });
             return;
         }
@@ -90,11 +100,13 @@ export function get(node: Element, reprocess: (node: Node) => void): void {
                 }
                 void fire();
             }, trigger.interval);
+            onCleanup(node, () => clearInterval(timer));
             return;
         }
 
         case 'event': {
             let debounce: ReturnType<typeof setTimeout> | undefined;
+            onCleanup(node, () => clearTimeout(debounce));
             node.addEventListener(trigger.event, e => {
                 // forms, links and submit buttons would also navigate the page
                 if (trigger.event === 'submit' || node.matches('a') || isSubmitButton(node)) {
@@ -124,8 +136,46 @@ export function get(node: Element, reprocess: (node: Node) => void): void {
                 }
             });
             observer.observe(node);
+            onCleanup(node, () => observer.disconnect());
             return;
         }
+
+        case 'sse': {
+            const streamUrl = withQuery(url, collectValues(node));
+            const unsubscribe = subscribe(
+                streamUrl,
+                trigger.event,
+                html => {
+                    if (!node.isConnected) {
+                        unsubscribe();
+                        return;
+                    }
+                    try {
+                        const target = resolveTarget(node);
+                        for (const inserted of swap(target, resolveSwap(node, target), html)) {
+                            reprocess(inserted);
+                        }
+                    } catch (error) {
+                        // one broken element must not break the shared stream: report it, carry on
+                        setTimeout(() => { throw error; });
+                    }
+                },
+                ({ error, status, retrying }) => {
+                    if (!node.isConnected) {
+                        unsubscribe();
+                        return;
+                    }
+                    if (!retrying && status !== undefined) {
+                        emit(node, 'x:responseError', { url: streamUrl, status });
+                    } else {
+                        emit(node, 'x:sendError', { url: streamUrl, error, status, retrying });
+                    }
+                },
+            );
+            onCleanup(node, unsubscribe);
+            return;
+        }
+
 
         default: {
             // a new Trigger kind without a case here is a compile error, not a silent no-op
@@ -194,7 +244,7 @@ describe('get', () => {
     describe('basics', () => {
         test('throws when the element has no x-get', () => {
             document.body.innerHTML = '<button>none</button>';
-            expect(() => get(document.querySelector('button')!, () => {})).toThrow(/x-get/);
+            expect(() => get(document.querySelector('button')!, () => { })).toThrow(/x-get/);
         });
 
         test('sends nothing until triggered', () => {
@@ -495,6 +545,95 @@ describe('get', () => {
             await settle();
 
             expect(server.requested).toEqual(['/jobs?before=40']);
+        });
+    });
+
+    describe('sse', () => {
+        const run = async (html: string): Promise<void> => {
+            document.body.innerHTML = html;
+            for (const el of document.querySelectorAll('[x-get]')) get(el, reprocessed);
+            await settle();
+        };
+        let reprocessedNodes: Node[] = [];
+        const reprocessed = (n: Node): void => { reprocessedNodes.push(n); };
+        beforeEach(() => { reprocessedNodes = []; });
+        const send = (text: string): void => server.streams[0]!.send(text);
+
+        test('subscribes on processing and swaps each matching event, then reprocesses it', async () => {
+            server.routes['/sse'] = { stream: true };
+            await run('<ul id="t" x-get="/sse" x-trigger="sse jobs" x-swap="afterbegin"></ul>');
+            send('event: jobs\ndata: <li>2</li>\n\nevent: other\ndata: <li>no</li>\n\nevent: jobs\ndata: <li>3</li>\n\n');
+            await settle();
+
+            expect(document.getElementById('t')!.innerHTML).toBe('<li>3</li><li>2</li>');
+            expect(reprocessedNodes.map(n => n.nodeName)).toEqual(['LI', 'LI']);
+        });
+
+        test('elements with the same URL share one connection', async () => {
+            server.routes['/sse'] = { stream: true };
+            await run('<p id="a" x-get="/sse" x-trigger="sse a">-</p><p id="b" x-get="/sse" x-trigger="sse b">-</p>');
+            send('event: b\ndata: B\n\nevent: a\ndata: A\n\n');
+            await settle();
+
+            expect(server.requested).toEqual(['/sse']);
+            expect(document.body.textContent).toBe('AB');
+        });
+
+        test('x-include and x-vals are read once, into the stream URL', async () => {
+            server.routes['/sse?lastEventId=7-0&scope=mine'] = { stream: true };
+            await run(`<input type="hidden" id="from" name="lastEventId" value="7-0"><p x-get="/sse" x-trigger="sse a" x-include="#from" x-vals='{"scope":"mine"}'></p>`);
+            (document.getElementById('from') as HTMLInputElement).value = '9-0';
+            await settle();
+
+            expect(server.requested).toEqual(['/sse?lastEventId=7-0&scope=mine']);
+        });
+
+        test('outerHTML: the replacement keeps listening; the old element drops out', async () => {
+            server.routes['/sse'] = { stream: true };
+            // the real process() would re-get the new element; here reprocess does exactly that
+            document.body.innerHTML = '<p id="job" x-get="/sse" x-trigger="sse job" x-swap="outerHTML">v1</p>';
+            const reget = (n: Node): void => { if (n instanceof Element && n.hasAttribute('x-get')) get(n, reget); };
+            get(document.getElementById('job')!, reget);
+            await settle();
+
+            send('event: job\ndata: <p id="job" x-get="/sse" x-trigger="sse job" x-swap="outerHTML">v2</p>\n\n');
+            await settle();
+            send('event: job\ndata: <p id="job" x-get="/sse" x-trigger="sse job" x-swap="outerHTML">v3</p>\n\n');
+            await settle();
+
+            expect(document.body.innerHTML).toBe('<p id="job" x-get="/sse" x-trigger="sse job" x-swap="outerHTML">v3</p>');
+        });
+
+        test('empty data with outerHTML removes the element', async () => {
+            server.routes['/sse'] = { stream: true };
+            await run('<div><p x-get="/sse" x-trigger="sse gone" x-swap="outerHTML">x</p></div>');
+            send('event: gone\ndata:\n\n');
+            await settle();
+            expect(document.body.innerHTML).toBe('<div></div>');
+        });
+
+        test('the last removed element closes the connection on the next message', async () => {
+            server.routes['/sse'] = { stream: true };
+            await run('<p x-get="/sse" x-trigger="sse a">x</p>');
+            document.body.innerHTML = '';
+            send('event: a\ndata: late\n\n');
+            await settle();
+            expect(server.streams[0]!.closed).toBe(true);
+        });
+
+        test('4xx on connect → x:responseError; 5xx → x:sendError with retrying', async () => {
+            const events: string[] = [];
+            const listening = new AbortController();
+            const { signal } = listening;
+            document.addEventListener('x:responseError', e => events.push(`response ${(e as CustomEvent).detail.status}`), { signal });
+            document.addEventListener('x:sendError', e => events.push(`send ${(e as CustomEvent).detail.status} ${(e as CustomEvent).detail.retrying}`), { signal });
+
+            server.routes['/a'] = { status: 403 };
+            server.routes['/b'] = { status: 503 };
+            await run('<p x-get="/a" x-trigger="sse a"></p><p x-get="/b" x-trigger="sse b"></p>');
+
+            expect(events.sort()).toEqual(['response 403', 'send 503 true']);
+            listening.abort();
         });
     });
 });
