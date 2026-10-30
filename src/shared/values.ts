@@ -1,189 +1,170 @@
-import { Modifiers } from './attrs';
+import { isControl, readControl, readForm, type Entry } from './form';
 
-type Control = HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement | HTMLButtonElement;
-
-/**
- * The values a request sends, in this order (later sources add to earlier ones,
- * except x-vals, which overrides):
- *
- *   1. the enclosing <form>'s fields, or, outside a form, the element's own name/value
- *   2. every form or named control matched by x-include (a page-wide CSS selector)
- *   3. the keys of x-vals (a JSON object of strings, numbers and booleans)
- *
- * Follows browser form rules: disabled and unnamed controls and unchecked
- * checkboxes/radios are skipped; multi-selects and repeated names give several values.
- *
- * @throws Error when a value is a File (it can't go in a query string), when
- *         x-include matches nothing, or when x-vals isn't a flat JSON object
+/** 
+ * The enclosing form's fields, or outside a form, the element's own value. 
  */
-export function collectValues(el: Element): URLSearchParams {
-    const params = new URLSearchParams();
-
+function ownValues(el: Element): Entry[] {
     const form = el.closest('form');
     if (form !== null) {
-        appendForm(params, form);
-    } else if (isControl(el)) {
-        appendControl(params, el);
+        return readForm(form);
     }
-
-    const include = el.getAttribute(Modifiers.INCLUDE);
-    if (include !== null) {
-        const matched = document.querySelectorAll(include);
-        if (matched.length === 0) {
-            throw new Error(`x-include matched nothing: ${include}`);
-        }
-        for (const source of matched) {
-            if (source instanceof HTMLFormElement) {
-                appendForm(params, source);
-            } else if (isControl(source)) {
-                appendControl(params, source);
-            } else {
-                throw new Error(`x-include must match forms or form controls, got <${source.localName}>: ${include}`);
-            }
-        }
-    }
-
-    const vals = el.getAttribute(Modifiers.VALS);
-    if (vals !== null) {
-        for (const [key, value] of Object.entries(parseVals(vals))) {
-            params.set(key, String(value));
-        }
-    }
-
-    return params;
+    return isControl(el) ? readControl(el) : [];
 }
 
-function isControl(el: Element): el is Control {
-    return el instanceof HTMLInputElement
-        || el instanceof HTMLSelectElement
-        || el instanceof HTMLTextAreaElement
-        || el instanceof HTMLButtonElement;
+/**
+ * The values a request sends, in this order:
+ *
+ *   1. the enclosing <form>'s fields, or, outside a form, the element's own name/value
+ *   2. `include`, added after 1 (a name in both is sent twice, like a form would)
+ *   3. `vals`, which replaces every value of a name it shares with 1 or 2
+ *
+ * The caller extracts `include` and `vals` (modifiers/), so shared/ depends on nothing outside it.
+ *
+ * @throws Error on a file field in the form or the element
+ */
+export function collectValues(el: Element, include: Entry[], vals: Entry[]): Entry[] {
+    const replaced = new Set(vals.map(([name]) => name));
+    const entries = [...ownValues(el), ...include].filter(([name]) => !replaced.has(name));
+    return [...entries, ...vals];
 }
 
-function appendForm(params: URLSearchParams, form: HTMLFormElement): void {
-    for (const [name, value] of new FormData(form)) {
+/**
+ * For GET/DELETE: the entries as a query string.
+ * @throws Error on a file: files can't go in a URL
+ */
+export function toQuery(entries: Entry[]): URLSearchParams {
+    const params = new URLSearchParams();
+    for (const [name, value] of entries) {
         if (typeof value !== 'string') {
-            throw new Error(`Field "${name}" is a file; files can't be sent with x-get`);
+            throw new Error(`Field "${name}" is a file; files can't be sent in a query string`);
         }
         params.append(name, value);
     }
+    return params;
 }
 
-function appendControl(params: URLSearchParams, el: Control): void {
-    if (el.name === '' || el.disabled) {
-        return;
+/** 
+ * For POST/PUT/PATCH: the entries as a request body (multipart, so files work). 
+ */
+export function toFormData(entries: Entry[]): FormData {
+    const data = new FormData();
+    for (const [name, value] of entries) {
+        data.append(name, value);
     }
-    if (el instanceof HTMLInputElement) {
-        if ((el.type === 'checkbox' || el.type === 'radio') && !el.checked) {
-            return;
-        }
-        if (el.type === 'file') {
-            throw new Error(`Field "${el.name}" is a file; files can't be sent with x-get`);
-        }
-    }
-    if (el instanceof HTMLSelectElement && el.multiple) {
-        for (const option of el.selectedOptions) {
-            params.append(el.name, option.value);
-        }
-        return;
-    }
-    params.append(el.name, el.value);
+    return data;
 }
 
-function parseVals(text: string): Record<string, string | number | boolean> {
-    let parsed: unknown;
-    try {
-        parsed = JSON.parse(text);
-    } catch {
-        throw new Error(`x-vals is not valid JSON: ${text}`);
-    }
-    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
-        throw new Error(`x-vals must be a JSON object: ${text}`);
-    }
-    for (const [key, value] of Object.entries(parsed)) {
-        if (!['string', 'number', 'boolean'].includes(typeof value)) {
-            throw new Error(`x-vals "${key}" must be a string, number or boolean: ${text}`);
-        }
-    }
-    return parsed as Record<string, string | number | boolean>;
-}
 
 // ---- tests (removed from the build) ----
 
-describe('collectValues', () => {
-    const values = (html: string, selector: string): string => {
-        document.body.innerHTML = html;
-        return collectValues(document.querySelector(selector)!).toString();
-    };
+describe('values', () => {
+    describe('collectValues', () => {
+        const collect = (html: string, selector: string, include: Entry[] = [], vals: Entry[] = []): Entry[] => {
+            document.body.innerHTML = html;
+            return collectValues(document.querySelector(selector)!, include, vals);
+        };
 
-    describe('own value, outside a form', () => {
-        test('a named input sends its value', () => {
-            expect(values('<input name="q" value="brake pads">', 'input')).toBe('q=brake+pads');
+        describe('own values, outside a form', () => {
+            test('a named control gives its value', () => {
+                expect(collect('<input name="q" value="brake pads">', 'input')).toEqual([['q', 'brake pads']]);
+            });
+            test('a non-control (div, a) gives nothing', () => {
+                expect(collect('<div name="q">x</div>', 'div')).toEqual([]);
+                expect(collect('<a href="/x">x</a>', 'a')).toEqual([]);
+            });
+            test('the control rules apply: unnamed, disabled, unchecked give nothing', () => {
+                expect(collect('<input value="x">', 'input')).toEqual([]);
+                expect(collect('<input name="q" value="x" disabled>', 'input')).toEqual([]);
+                expect(collect('<input type="checkbox" name="u" value="1">', 'input')).toEqual([]);
+            });
         });
-        test('an unnamed element sends nothing', () => {
-            expect(values('<input value="x">', 'input')).toBe('');
-            expect(values('<button>go</button>', 'button')).toBe('');
+
+        describe('own values, inside a form', () => {
+            const form = '<form><input name="plate" value="CAB-1"><select name="status"><option value="open" selected>open</option></select><button>go</button></form>';
+
+            test('the whole form, whichever element triggered', () => {
+                expect(collect(form, 'button')).toEqual([['plate', 'CAB-1'], ['status', 'open']]);
+                expect(collect(form, 'form')).toEqual([['plate', 'CAB-1'], ['status', 'open']]);
+                expect(collect(form, 'input')).toEqual([['plate', 'CAB-1'], ['status', 'open']]);
+            });
+            test('the form wins over the element: a control inside it is not added twice', () => {
+                expect(collect('<form><input name="q" value="1"></form>', 'input')).toEqual([['q', '1']]);
+            });
+            test('repeated names keep every value', () => {
+                const html = '<form><input type="checkbox" name="s[]" value="3" checked><input type="checkbox" name="s[]" value="7" checked><button>go</button></form>';
+                expect(collect(html, 'button')).toEqual([['s[]', '3'], ['s[]', '7']]);
+            });
         });
-        test('disabled controls and unchecked checkboxes send nothing', () => {
-            expect(values('<input name="q" value="x" disabled>', 'input')).toBe('');
-            expect(values('<input type="checkbox" name="urgent" value="1">', 'input')).toBe('');
+
+        describe('include', () => {
+            test('is added after the own values', () => {
+                expect(collect('<input name="q" value="1">', 'input', [['extra', '2']])).toEqual([['q', '1'], ['extra', '2']]);
+            });
+            test('a name in both is kept twice, like a form would send it', () => {
+                expect(collect('<input name="q" value="1">', 'input', [['q', '2']])).toEqual([['q', '1'], ['q', '2']]);
+            });
+            test('works with no own values', () => {
+                expect(collect('<div>x</div>', 'div', [['a', '1']])).toEqual([['a', '1']]);
+            });
         });
-        test('a checked checkbox sends its value', () => {
-            expect(values('<input type="checkbox" name="urgent" value="1" checked>', 'input')).toBe('urgent=1');
+
+        describe('vals', () => {
+            test('are added last', () => {
+                expect(collect('<input name="q" value="1">', 'input', [['i', '2']], [['v', '3']]))
+                    .toEqual([['q', '1'], ['i', '2'], ['v', '3']]);
+            });
+            test('replace every value of a shared name, from the form and from include', () => {
+                const html = '<form><input type="checkbox" name="s" value="1" checked><input type="checkbox" name="s" value="2" checked><input name="keep" value="k"><button>go</button></form>';
+                expect(collect(html, 'button', [['s', '3']], [['s', '9']]))
+                    .toEqual([['keep', 'k'], ['s', '9']]);
+            });
+            test('a name only in vals is simply added', () => {
+                expect(collect('<div>x</div>', 'div', [], [['page', '2']])).toEqual([['page', '2']]);
+            });
+            test('vals can carry several values for one name, and they all replace the earlier ones', () => {
+                expect(collect('<input name="s" value="1">', 'input', [['s', '2']], [['s', '8'], ['s', '9']]))
+                    .toEqual([['s', '8'], ['s', '9']]);
+            });
         });
-        test('a multi-select sends every selected option', () => {
-            const html = '<select name="s" multiple><option value="a" selected>a</option><option value="b">b</option><option value="c" selected>c</option></select>';
-            expect(values(html, 'select')).toBe('s=a&s=c');
+
+        test('nothing anywhere gives nothing', () => {
+            expect(collect('<div>x</div>', 'div')).toEqual([]);
+        });
+
+        test('files pass through untouched (rejecting them is toQuery\'s job)', () => {
+            const file = new File(['x'], 'a.png', { type: 'image/png' });
+            expect(collect('<div>x</div>', 'div', [['photo', file]])).toEqual([['photo', file]]);
         });
     });
 
-    describe('inside a form', () => {
-        test('sends the whole form, whichever element triggered', () => {
-            const html = '<form><input name="plate" value="CAB-1"><select name="status"><option value="open" selected>open</option></select><button>go</button></form>';
-            expect(values(html, 'button')).toBe('plate=CAB-1&status=open');
-            expect(values(html, 'form')).toBe('plate=CAB-1&status=open');
+    describe('toQuery', () => {
+        const file = new File(['x'], 'a.png', { type: 'image/png' });
+
+        test('keeps order and repeated names', () => {
+            expect(toQuery([['a', '1'], ['s', '2'], ['s', '3']]).toString()).toBe('a=1&s=2&s=3');
         });
-        test('repeated names (checkbox groups) give several values', () => {
-            const html = '<form><input type="checkbox" name="s[]" value="3" checked><input type="checkbox" name="s[]" value="5"><input type="checkbox" name="s[]" value="7" checked><button>go</button></form>';
-            expect(values(html, 'button')).toBe('s%5B%5D=3&s%5B%5D=7');
+        test('encodes like a query string', () => {
+            expect(toQuery([['q', 'brake pads & discs'], ['s[]', '1']]).toString()).toBe('q=brake+pads+%26+discs&s%5B%5D=1');
+        });
+        test('no entries give an empty query', () => {
+            expect(toQuery([]).size).toBe(0);
+        });
+        test('a file throws, naming the field', () => {
+            expect(() => toQuery([['a', '1'], ['photo', file]])).toThrow(/"photo"/);
         });
     });
 
-    describe('x-include', () => {
-        test('adds matched controls from anywhere on the page', () => {
-            const html = '<input id="f" name="plate" value="CAB-1"><button x-include="#f">go</button>';
-            expect(values(html, 'button')).toBe('plate=CAB-1');
-        });
-        test('a matched form adds all its fields', () => {
-            const html = '<form id="filters"><input name="a" value="1"><input name="b" value="2"></form><button x-include="#filters">go</button>';
-            expect(values(html, 'button')).toBe('a=1&b=2');
-        });
-        test('comes after the element\'s own values', () => {
-            const html = '<input id="f" name="extra" value="2"><input name="q" value="1" x-include="#f">';
-            expect(values(html, 'input[name=q]')).toBe('q=1&extra=2');
-        });
-        test('matching nothing throws', () => {
-            expect(() => values('<button x-include="#missing">go</button>', 'button')).toThrow(/#missing/);
-        });
-        test('matching a non-control throws', () => {
-            expect(() => values('<div id="d"></div><button x-include="#d">go</button>', 'button')).toThrow(/<div>/);
-        });
-    });
+    describe('toFormData', () => {
+        const file = new File(['x'], 'a.png', { type: 'image/png' });
 
-    describe('x-vals', () => {
-        test('adds strings, numbers and booleans', () => {
-            const html = `<button x-vals='{"status":"open","page":2,"urgent":true}'>go</button>`;
-            expect(values(html, 'button')).toBe('status=open&page=2&urgent=true');
+        test('keeps strings, files and repeated names, in order', () => {
+            const data = toFormData([['a', '1'], ['photo', file], ['a', '2']]);
+            expect([...data.keys()]).toEqual(['a', 'photo', 'a']);
+            expect(data.getAll('a')).toEqual(['1', '2']);
+            expect((data.get('photo') as File).name).toBe('a.png');
         });
-        test('overrides a field with the same name', () => {
-            const html = `<form><input name="status" value="closed"><button x-vals='{"status":"open"}'>go</button></form>`;
-            expect(values(html, 'button')).toBe('status=open');
-        });
-        test('invalid JSON, non-objects and nested values throw', () => {
-            expect(() => values(`<button x-vals='{status:open}'>go</button>`, 'button')).toThrow(/JSON/);
-            expect(() => values(`<button x-vals='["a"]'>go</button>`, 'button')).toThrow(/object/);
-            expect(() => values(`<button x-vals='{"a":{"b":1}}'>go</button>`, 'button')).toThrow(/"a"/);
-            expect(() => values(`<button x-vals='{"a":null}'>go</button>`, 'button')).toThrow(/"a"/);
+        test('no entries give an empty body', () => {
+            expect([...toFormData([])]).toEqual([]);
         });
     });
 });

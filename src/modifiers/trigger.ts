@@ -23,7 +23,7 @@ export type Trigger =
     | { kind: 'sse'; event: string }
     | { kind: 'every'; interval: number }
     | { kind: 'event'; event: string; delay: number }
-;
+    ;
 
 /** Inputs that are clicked, not changed. */
 const CLICKED_INPUTS = new Set(['submit', 'button', 'reset', 'image']);
@@ -65,8 +65,8 @@ export function resolveTrigger(el: Element): Trigger {
             if (rest.length > 0) {
                 throw new Error(`x-trigger "load" takes no modifiers: ${value}`);
             }
-            return { 
-                kind: 'load' 
+            return {
+                kind: 'load'
             };
 
         case 'revealed':
@@ -86,11 +86,11 @@ export function resolveTrigger(el: Element): Trigger {
             if (rest.length !== 1) {
                 throw new Error(`x-trigger "every" needs exactly one duration, e.g. "every 5s": ${value}`);
             }
-            return { 
-                kind: 'every', 
-                interval: duration(rest[0]!, value) 
+            return {
+                kind: 'every',
+                interval: duration(rest[0]!, value)
             };
-    
+
         default: /* events */
             let delay = 0;
             for (const modifier of rest) {
@@ -100,10 +100,10 @@ export function resolveTrigger(el: Element): Trigger {
                     throw new Error(`Unknown x-trigger modifier "${modifier}": ${value}`);
                 }
             }
-            return { 
-                kind: 'event', 
-                event: first, 
-                delay: delay 
+            return {
+                kind: 'event',
+                event: first,
+                delay: delay
             };
     }
 }
@@ -119,89 +119,91 @@ function duration(text: string, whole: string): number {
 
 // ---- tests (removed from the build) ----
 
-describe('resolveTrigger', () => {
-    const on = (html: string): Element => {
-        document.body.innerHTML = html;
-        return document.body.firstElementChild!;
-    };
- 
-    describe('defaults', () => {
-        test('form → submit', () => {
-            expect(resolveTrigger(on('<form></form>'))).toEqual({ kind: 'event', event: 'submit', delay: 0 });
-        });
-        test('text input, select, textarea → change', () => {
-            for (const html of ['<input>', '<input type="search">', '<select></select>', '<textarea></textarea>']) {
-                expect(resolveTrigger(on(html))).toEqual({ kind: 'event', event: 'change', delay: 0 });
-            }
-        });
-        test('button-like inputs → click', () => {
-            for (const type of ['submit', 'button', 'reset', 'image']) {
-                expect(resolveTrigger(on(`<input type="${type}">`))).toEqual({ kind: 'event', event: 'click', delay: 0 });
-            }
-        });
-        test('anything else → click, including tags not in the table', () => {
-            expect(resolveTrigger(on('<button></button>'))).toEqual({ kind: 'event', event: 'click', delay: 0 });
-            expect(resolveTrigger(on('<job-card></job-card>'))).toEqual({ kind: 'event', event: 'click', delay: 0 });
-        });
-    });
- 
-    describe('x-trigger values', () => {
-        test('a plain event', () => {
-            expect(resolveTrigger(on('<input x-trigger="keyup">'))).toEqual({ kind: 'event', event: 'keyup', delay: 0 });
-        });
-        test('delay in ms and s, extra whitespace ignored', () => {
-            expect(resolveTrigger(on('<input x-trigger="keyup delay:300ms">'))).toEqual({ kind: 'event', event: 'keyup', delay: 300 });
-            expect(resolveTrigger(on('<input x-trigger="  input   delay:2s ">'))).toEqual({ kind: 'event', event: 'input', delay: 2000 });
-        });
-        test('load', () => {
-            expect(resolveTrigger(on('<div x-trigger="load"></div>'))).toEqual({ kind: 'load' });
-        });
-        test('every', () => {
-            expect(resolveTrigger(on('<div x-trigger="every 5s"></div>'))).toEqual({ kind: 'every', interval: 5000 });
-            expect(resolveTrigger(on('<div x-trigger="every 250ms"></div>'))).toEqual({ kind: 'every', interval: 250 });
-        });
-        test('revealed', () => {
-            expect(resolveTrigger(on('<div x-trigger="revealed"></div>'))).toEqual({ kind: 'revealed' });
-        });
-        test('is not inherited from ancestors', () => {
-            document.body.innerHTML = '<form x-trigger="keyup"><button>b</button></form>';
-            expect(resolveTrigger(document.querySelector('button')!)).toEqual({ kind: 'event', event: 'click', delay: 0 });
-        });
-    });
- 
-    describe('invalid values throw', () => {
-        const invalid = [
-            ['', /empty/],
-            ['   ', /empty/],
-            ['keyup delay:300', /duration/],
-            ['keyup delay:abc', /duration/],
-            ['keyup throttle:1s', /modifier/],
-            ['load delay:1s', /load/],
-            ['every', /every/],
-            ['every 5', /duration/],
-            ['every 1s 2s', /every/],
-            ['revealed delay:1s', /revealed/],
-        ] as const;
-        for (const [value, message] of invalid) {
-            test(JSON.stringify(value), () => {
-                expect(() => resolveTrigger(on(`<div x-trigger="${value}"></div>`))).toThrow(message);
-            });
-        }
-    });
-
-    describe('sse', () => {
-        const parse = (value: string): Trigger => {
-            document.body.innerHTML = `<div x-trigger="${value}"></div>`;
-            return resolveTrigger(document.querySelector('div')!);
+describe('resolve', () => {
+    describe('resolveTrigger', () => {
+        const on = (html: string): Element => {
+            document.body.innerHTML = html;
+            return document.body.firstElementChild!;
         };
-        test('"sse <event>" takes the event name, colons included', () => {
-            expect(parse('sse job:update:1')).toEqual({ kind: 'sse', event: 'job:update:1' });
-            expect(parse('  sse   a  ')).toEqual({ kind: 'sse', event: 'a' });
+
+        describe('defaults', () => {
+            test('form → submit', () => {
+                expect(resolveTrigger(on('<form></form>'))).toEqual({ kind: 'event', event: 'submit', delay: 0 });
+            });
+            test('text input, select, textarea → change', () => {
+                for (const html of ['<input>', '<input type="search">', '<select></select>', '<textarea></textarea>']) {
+                    expect(resolveTrigger(on(html))).toEqual({ kind: 'event', event: 'change', delay: 0 });
+                }
+            });
+            test('button-like inputs → click', () => {
+                for (const type of ['submit', 'button', 'reset', 'image']) {
+                    expect(resolveTrigger(on(`<input type="${type}">`))).toEqual({ kind: 'event', event: 'click', delay: 0 });
+                }
+            });
+            test('anything else → click, including tags not in the table', () => {
+                expect(resolveTrigger(on('<button></button>'))).toEqual({ kind: 'event', event: 'click', delay: 0 });
+                expect(resolveTrigger(on('<job-card></job-card>'))).toEqual({ kind: 'event', event: 'click', delay: 0 });
+            });
         });
-        test('no name, two names or a modifier throws', () => {
-            expect(() => parse('sse')).toThrow(/exactly one/);
-            expect(() => parse('sse a b')).toThrow(/exactly one/);
-            expect(() => parse('sse a delay:1s')).toThrow(/exactly one/);
+
+        describe('x-trigger values', () => {
+            test('a plain event', () => {
+                expect(resolveTrigger(on('<input x-trigger="keyup">'))).toEqual({ kind: 'event', event: 'keyup', delay: 0 });
+            });
+            test('delay in ms and s, extra whitespace ignored', () => {
+                expect(resolveTrigger(on('<input x-trigger="keyup delay:300ms">'))).toEqual({ kind: 'event', event: 'keyup', delay: 300 });
+                expect(resolveTrigger(on('<input x-trigger="  input   delay:2s ">'))).toEqual({ kind: 'event', event: 'input', delay: 2000 });
+            });
+            test('load', () => {
+                expect(resolveTrigger(on('<div x-trigger="load"></div>'))).toEqual({ kind: 'load' });
+            });
+            test('every', () => {
+                expect(resolveTrigger(on('<div x-trigger="every 5s"></div>'))).toEqual({ kind: 'every', interval: 5000 });
+                expect(resolveTrigger(on('<div x-trigger="every 250ms"></div>'))).toEqual({ kind: 'every', interval: 250 });
+            });
+            test('revealed', () => {
+                expect(resolveTrigger(on('<div x-trigger="revealed"></div>'))).toEqual({ kind: 'revealed' });
+            });
+            test('is not inherited from ancestors', () => {
+                document.body.innerHTML = '<form x-trigger="keyup"><button>b</button></form>';
+                expect(resolveTrigger(document.querySelector('button')!)).toEqual({ kind: 'event', event: 'click', delay: 0 });
+            });
+        });
+
+        describe('invalid values throw', () => {
+            const invalid = [
+                ['', /empty/],
+                ['   ', /empty/],
+                ['keyup delay:300', /duration/],
+                ['keyup delay:abc', /duration/],
+                ['keyup throttle:1s', /modifier/],
+                ['load delay:1s', /load/],
+                ['every', /every/],
+                ['every 5', /duration/],
+                ['every 1s 2s', /every/],
+                ['revealed delay:1s', /revealed/],
+            ] as const;
+            for (const [value, message] of invalid) {
+                test(JSON.stringify(value), () => {
+                    expect(() => resolveTrigger(on(`<div x-trigger="${value}"></div>`))).toThrow(message);
+                });
+            }
+        });
+
+        describe('sse', () => {
+            const parse = (value: string): Trigger => {
+                document.body.innerHTML = `<div x-trigger="${value}"></div>`;
+                return resolveTrigger(document.querySelector('div')!);
+            };
+            test('"sse <event>" takes the event name, colons included', () => {
+                expect(parse('sse job:update:1')).toEqual({ kind: 'sse', event: 'job:update:1' });
+                expect(parse('  sse   a  ')).toEqual({ kind: 'sse', event: 'a' });
+            });
+            test('no name, two names or a modifier throws', () => {
+                expect(() => parse('sse')).toThrow(/exactly one/);
+                expect(() => parse('sse a b')).toThrow(/exactly one/);
+                expect(() => parse('sse a delay:1s')).toThrow(/exactly one/);
+            });
         });
     });
 });

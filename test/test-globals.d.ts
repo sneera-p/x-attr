@@ -19,6 +19,8 @@ declare global {
         fail?: true;
         /** Respond with an open stream; push into it via server.streams. */
         stream?: true;
+        /** Answer with a plain 3xx to this URL (seen by the client as an opaque redirect). */
+        redirect?: string;
     };
 
     /** One open streamed response (a route with `stream: true`). */
@@ -44,6 +46,8 @@ declare global {
         requested: string[];
         /** Every stream opened, in order. */
         streams: FakeStream[];
+        /** The request headers of every fetch, in the same order as `requested`. */
+        headers: Headers[];
     }
 
     const server: FakeServer;

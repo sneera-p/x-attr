@@ -1,5 +1,6 @@
 import { Verbs } from './shared/attrs';
 import { HANDLERS } from './handlers';
+import { XEvents } from './shared/events';
 
 /**
  * wires node with x-attr properties
@@ -281,7 +282,7 @@ describe('process', () => {
             server.routes['/live4'] = { stream: true };
             start('<div x-get="/live4" x-trigger="sse a"></div>');
             await settle();
-            send('event: x:refresh\ndata: stale\n\n');
+            send(`event: ${XEvents.REFRESH}\ndata: stale\n\n`);
             await settle();
             expect(page.reloads).toBe(1);
             expect(server.streams[0]!.closed).toBe(true);
@@ -289,7 +290,7 @@ describe('process', () => {
             // the fake reload leaves the page here: the same URL gets a fresh connection
             start('<div x-get="/live4" x-trigger="sse a"></div>');
             await settle();
-            server.streams[1]!.send('event: x:redirect\ndata: /login\n\n');
+            server.streams[1]!.send(`event: ${XEvents.REDIRECT}\ndata: /login\n\n`);
             await settle();
             expect(page.navigated).toEqual(['/login']);
         });

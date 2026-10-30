@@ -8,11 +8,15 @@ GlobalRegistrator.register({ url: 'http://localhost/' });
  * A route is HTML (status 200), or a spec for anything else. Unknown URLs → 404.
  * Requests honour AbortSignal like the real fetch: an aborted request rejects with AbortError.
  */
-const server: FakeServer = { routes: {}, requested: [], streams: [] };
+const server: FakeServer = { routes: {}, requested: [], headers: [], streams: [] };
 
 globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
-    const url = String(input);
+    
+    // Same-origin absolute URLs are looked up and recorded by path, like the relative ones tests write.
+    const raw = String(input);
+    const url = raw.startsWith(location.origin + '/') ? raw.slice(location.origin.length) : raw;
     server.requested.push(url);
+    server.headers.push(new Headers(init?.headers));
 
     const route = server.routes[url];
     const spec = typeof route === 'string' ? { body: route } : route;
@@ -25,6 +29,16 @@ globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) =>
     }
     if (spec === undefined) {
         return new Response('not found', { status: 404 });
+    }
+    if (spec.redirect !== undefined) {
+        // what fetch gives JS for a 3xx under redirect: 'manual': no status, no headers, no body
+        if (init?.redirect !== 'manual') {
+            throw new Error('fake server: a plain redirect was requested without redirect: "manual"');
+        }
+        return {
+            type: 'opaqueredirect', status: 0, ok: false, redirected: false, url: '',
+            headers: new Headers(), body: null, text: async () => '',
+        } as unknown as Response;
     }
     if (spec.fail) {
         throw new TypeError('Failed to fetch');
@@ -110,10 +124,13 @@ Object.assign(globalThis, { server, settle, viewport, page });
 beforeEach(() => {
     document.body.innerHTML = '';
     server.routes = {};
-    for (const s of server.streams) s.end();
+    for (const s of server.streams) 
+        s.end();
     server.requested = [];
     server.streams = [];
-    for (const o of [...observers]) o.disconnect();
+    for (const o of [...observers]) 
+        o.disconnect();
     page.navigated = [];
     page.reloads = 0;
+    server.headers = [];
 });

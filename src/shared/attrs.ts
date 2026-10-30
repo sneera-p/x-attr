@@ -1,5 +1,4 @@
 export enum Verbs {
-    // methods
     GET = 'x-get',
     POST = 'x-post',
     PUT = 'x-put', 

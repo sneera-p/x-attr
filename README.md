@@ -98,7 +98,8 @@ If your own JavaScript adds or removes `x-*` elements, tell it (see
 ```
 
 Sends `GET <url>` with the element's values as a query string (see
-[x-include](#x-include)), and swaps the response in.
+[Which values are sent](#which-values-are-sent-in-order)), and swaps the response in.
+Every request carries `X-Attr-Request: true` and `Accept: text/html`.
 
 - One verb per element. Two verbs on one element is an error.
 - `x-post`, `x-put`, `x-patch` and `x-delete` are reserved and **not implemented yet**: using
@@ -196,20 +197,27 @@ own value is sent).
 
 ### x-vals
 
-Fixed values, as a flat JSON object of strings, numbers and booleans. They override
-values with the same name from the other sources.
+Fixed values. They replace every value with the same name from the other sources.
+Two formats; the value starts with `{` → JSON, otherwise a query string:
 
 ```html
+<!-- query string: repeated names allowed -->
+<button x-get="/jobs" x-vals="status=open&page=2&s[]=3&s[]=7">Open jobs</button>
+
+<!-- flat JSON object of strings, numbers and booleans -->
 <button x-get="/jobs" x-vals='{"status": "open", "page": 2}'>Open jobs</button>
 ```
 
-Invalid JSON, a non-object, or nested/`null` values are errors.
+From PHP, build the query-string form with
+`htmlspecialchars(http_build_query([...]))`: values are percent-encoded and the attribute stays
+valid. In JSON, invalid JSON, a non-object, or nested/`null` values are errors; a name can
+appear only once.
 
 #### Which values are sent, in order
 
 1. the enclosing `<form>`'s fields, or, outside a form, the element's own `name`/`value`;
 2. everything matched by `x-include`;
-3. `x-vals`, overriding names from 1 and 2.
+3. `x-vals`, replacing every value of a name it shares with 1 or 2.
 
 Browser form rules apply: disabled and unnamed controls and unchecked checkboxes/radios are
 skipped; multi-selects and repeated names (`status[]`) give several values. File inputs are
@@ -221,10 +229,11 @@ an error with `x-get`, since files can't go in a query string.
 
 | Response | What happens |
 |---|---|
-| `X-Redirect: <url>` header | the page navigates to `<url>` (`location.assign`); nothing is swapped. Any status. |
+| `X-Attr-Redirect: <url>` header | the page navigates to `<url>` (`location.assign`); nothing is swapped. Any status except 3xx; `204` is usual. |
+| a plain 3xx redirect | not followed: the page reloads, so the page route's own redirect takes over |
 | 2xx | the body is swapped into the target |
-| any other status | nothing is swapped; `x:responseError` is dispatched on the element |
-| network failure | `x:sendError` is dispatched on the element |
+| any other status | nothing is swapped; `x-attr:response-error` is dispatched on the element |
+| network failure | `x-attr:request-error` is dispatched on the element |
 
 If the element was removed from the page while the request was in flight, the response is
 ignored.
@@ -232,9 +241,19 @@ ignored.
 **Respond with fragments.** A request from `x-get` wants only the HTML that goes into the
 target, not a full page. Return exactly the markup to insert.
 
-**Use `X-Redirect` for session expiry and similar.** A normal HTTP redirect (`302`) is
-followed by `fetch` itself, so the login page would be swapped into the target. With
-`X-Redirect` the whole page goes there instead.
+**Send `X-Attr-Redirect` to library requests, `302` to page loads.** Middleware that redirects
+(an expired session, say) can tell the two apart by the `X-Attr-Request` header:
+
+```php
+if (isset($request->headers[RequestHeaders::XAttrRequest])) {
+    return Response::empty(HttpStatus::NoContent, [ResponseHeaders::XAttrRedirect->value => ['/login']]);
+}
+return Response::redirect('/login');
+```
+
+A plain `302` sent to a library request still ends well (the page reloads and the page
+route redirects), but costs an extra round trip and lands wherever the page route sends it,
+not necessarily where the `302` pointed.
 
 ---
 
@@ -277,13 +296,15 @@ data:
 
 | Situation | Behaviour |
 |---|---|
-| stream ends, network fails, or 5xx | reconnects after 1 s, doubling up to 30 s (or the server's `retry:` value); a successful connect resets the wait. `x:sendError` with `retrying: true` |
-| 4xx | stops for good; `x:responseError` with the status |
-| `X-Redirect` header on connect | navigates there; stops |
-| `event: x:redirect`, `data: <url>` | navigates there; stops |
-| `event: x:refresh` | reloads the page; stops |
+| stream ends, network fails, or 5xx | reconnects after 1 s, doubling up to 30 s (or the server's `retry:` value, which then stays); a successful connect resets the wait. `x-attr:request-error` with `retrying: true` |
+| 4xx | stops for good; `x-attr:response-error` with the status |
+| `X-Attr-Redirect` header on connect | navigates there; stops |
+| a plain 3xx on connect | reloads the page; stops |
+| `event: x-attr:redirect`, `data: <url>` | navigates there; stops |
+| `event: x-attr:refresh` | reloads the page; stops |
 
-The `x:` event names are reserved and never reach elements.
+The `x-attr:redirect` and `x-attr:refresh` event names are reserved and never reach elements.
+Stream connects carry `Accept: text/event-stream` and `X-Attr-Request: true`.
 
 ### Not missing anything: Last-Event-ID
 
@@ -300,9 +321,16 @@ stream opening, put the id the page was rendered at in a hidden input and includ
 
 The server should then use, in order: the `Last-Event-ID` header (a reconnect), the
 `lastEventId` query value (first connect), or "from now". If the id is too old to replay,
-send `event: x:refresh` so the page reloads with fresh state.
+send `event: x-attr:refresh` so the page reloads with fresh state.
+
+The id can also come from `x-vals` (`x-vals="lastEventId=…"`), but only on page-level markup:
+a fragment rendered later would carry a newer id, which is a different URL and so a separate
+connection.
 
 ### Server side (PHP sketch)
+
+Every `data:` line must be prefixed: a multi-line fragment sent as one `data:` line loses
+everything after its first line break.
 
 ```php
 header('Content-Type: text/event-stream');
@@ -335,11 +363,11 @@ All bubble, so one listener on `document` handles every element.
 
 | Event | `detail` | When |
 |---|---|---|
-| `x:responseError` | `{ url, status }` | non-2xx response; for streams, a 4xx (the stream has stopped) |
-| `x:sendError` | `{ url, error }`; for streams also `status` and `retrying` | network failure; for streams, also 5xx and dropped connections |
+| `x-attr:response-error` | `{ url, status }` | non-2xx response; for streams, a 4xx (the stream has stopped) |
+| `x-attr:request-error` | `{ url, message }`; for streams also `status` and `retrying` | network failure; for streams, also 5xx and dropped connections |
 
 ```js
-document.addEventListener('x:responseError', e => {
+document.addEventListener('x-attr:response-error', e => {
     console.warn(`${e.detail.url} answered ${e.detail.status}`);
 });
 ```
@@ -380,7 +408,7 @@ offending value in the message, instead of silently doing nothing:
 - two verbs on one element, or a verb that isn't implemented yet;
 - an invalid `x-trigger`, `x-swap` or `x-vals`;
 - an `x-target` or `x-include` that matches nothing;
-- a file input in an `x-get` request.
+- a file input in an `x-get` request (files can't go in a query string).
 
 An error in one element wired from a stream message is reported (thrown asynchronously, so
 it appears in the console) without breaking the stream for other elements.
@@ -403,11 +431,25 @@ bun run build       # tsdown → dist/
   import from `bun:test`, and the build strips them.
 - `test/setup.ts` is preloaded for every test file. It provides happy-dom and fakes:
   - `server`: the fake `fetch`. `server.routes[url]` is an HTML string, or
-    `{ body, status, headers, delay, fail, stream }`; unknown URLs answer 404.
-    `server.requested` lists every URL fetched; `server.streams` lists every open stream,
-    with `send(text)`, `end()`, `fail()`, `closed` and `lastEventId`.
+    `{ body, status, headers, delay, fail, stream, redirect }`; unknown URLs answer 404.
+    `redirect` answers like a plain 3xx under `redirect: 'manual'` (an opaque redirect).
+    Same-origin absolute URLs are matched and recorded by path.
+    `server.requested` lists every URL fetched, `server.headers` their request headers;
+    `server.streams` lists every open stream, with `send(text)`, `end()`, `fail()`, `closed`
+    and `lastEventId`.
   - `viewport`: drives the fake IntersectionObserver (`reveal(el)`, `hide(el)`, `isObserved(el)`).
   - `page`: records `location.assign` (`page.navigated`) and `location.reload` (`page.reloads`).
   - `settle(ms)`: waits for timers and pending fetches.
-- Stream connections are module state and outlive a test, so each SSE test should use its own
-  URL.
+- SSE connections are shared, module-level state and outlive a test. A test that wires SSE
+  elements cleans up after itself with `cleanup(document.body)` (and a `settle()`) in
+  `afterEach`, so its streams close before the next test.
+
+### Source layout
+
+| Folder | Holds |
+|---|---|
+| `handlers/` | one wiring function per verb (`get.ts`, …) |
+| `fire/` | shared by every verb: `request.ts` (build, send, handle the response) and `bind.ts` (carry out `x-trigger`) |
+| `modifiers/` | the attribute readers: target, swap, trigger, include, vals |
+| `shared/` | building blocks with no dependencies outside `shared/`: values, form reading, cleanup, headers, events |
+| `sse/` | `parse.ts` (wire format), `stream.ts` (one connection, page-free), `transport.ts` (messages), `broker.ts` (owns connections), `subscriber.ts` (the tab side), `index.ts` (wires them, lazily) |

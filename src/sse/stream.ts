@@ -1,407 +1,690 @@
-export type Message = {
-    event: string;
-    data: string;
+import { XEvents } from "../shared/events";
+import { XHeaders } from "../shared/headers";
+import { type Message, type Parser, createParser } from "./parse";
+
+type StreamError = {
+    message: string;
+    status?: number;    // HTTP status, when the server answered at all.
 };
 
-export type StreamError = {
-    error: unknown;
-    /** HTTP status, when the server answered at all. */
-    status?: number;
-    /** False means the stream is closed for good; true means a reconnect is scheduled. */
-    retrying: boolean;
-};
+export type StreamEnd =
+    | { reason: 'redirect'; url: string }       // X-Attr-Redirect header, or x:redirect event
+    | { reason: 'refresh' }                     // x:refresh event, or a plain 3xx
+    | { reason: 'rejected'; status: number };   // 4xx
 
-const FIRST_DELAY = 1000;
-const MAX_DELAY = 30000;
-
-/**
- * Opens a connection to an SSE endpoint and keeps it open.
- *
- * - Reconnects on network errors, 5xx and stream end: waits 1s, doubling up to 30s,
- *   or the server's `retry:` value. A successful connect resets the wait.
- *   Reconnects send `Last-Event-ID` so the server can replay what was missed.
- * - 4xx: closes for good (`retrying: false`).
- * - `X-Redirect` header on connect, or an `x:redirect` event: closes and navigates.
- * - `x:refresh` event: closes and reloads the page.
- * Reserved `x:` events never reach `onMessage`.
- * `onEnd` is called once when the stream closes for good on the server's say-so
- * (4xx, X-Redirect, x:redirect, x:refresh); never after the caller's own close().
- * 
- * @param url SSE endpoint URL
- * @param onMessage Called with each event sent
- * @param onError Called with every error of the stream
- * @param onEnd Closed for good by the server's instruction, not by the caller
- *
- * @returns Function to close the connection (safe to call twice)
- *
- * eg:
- *  const close = open('/staff/updates', msg => console.log(msg), err => console.log(err), () => console.log('ended'));
- */
-export function open(
+type StreamState = {
     url: string,
-    onMessage: (message: Message) => void,
-    onError: (error: StreamError) => void,
-    onEnd: () => void,
-): () => void {
-    let closed = false;
-    let lastEventId: string | null = null;
-    let delay = FIRST_DELAY;
-    let serverRetry: number | null = null;
-    let controller: AbortController | null = null;
-    let timer: ReturnType<typeof setTimeout> | undefined;
+    closed: boolean,
+    lastEventId: string | null,
+    retry: {
+        /**
+         * backoff: grows on failure, resets on connect
+         * server: set by the server's `retry:`, fixed from then on
+        */
+        type: 'backoff' | 'server',
+        delay: number,
+    }
+    controller: AbortController | null,
+    timer: ReturnType<typeof setTimeout> | undefined,
+};
 
-    const close = (): void => {
-        closed = true;
-        clearTimeout(timer);
-        controller?.abort();
+type StreamOutcome =
+    | { kind: 'redirect'; url: string }      // X-Attr-Redirect
+    | { kind: 'reload' }                     // opaqueredirect (plain 3xx)
+    | { kind: 'stop'; status: number }       // 4xx
+    | { kind: 'retry'; status?: number }     // 5xx, no body
+    | { kind: 'read' };                      // 2xx with a body
+
+export type StreamCallbacks = {
+    onMessage: (message: Message) => void,
+    onId: (id: string) => void,
+    onError: (error: StreamError) => void,
+    onEnd: (end: StreamEnd) => void,
+};
+
+const DELAY = {
+    MIN: 1000,
+    MAX: 30000,
+} as const;
+
+/** 
+ * The headers of one connect attempt:
+ *  - Accept
+ *  - X-Attr-Request
+ *  - Last-Event-ID (once an id is known)
+ */
+function headers(state: StreamState): Record<string, string> {
+    const headers: Record<string, string> = {
+        'Accept': 'text/event-stream',
+        [XHeaders.REQUEST]: 'true',
     };
 
-    const retry = (error: unknown, status?: number): void => {
-        if (closed) {
+    if (state.lastEventId !== null)
+        headers[XHeaders.LAST_EVENT_ID] = state.lastEventId;
+
+    return headers;
+}
+
+function classify(response: Response): StreamOutcome {
+    // A plain 3xx under redirect: 'manual': no status, no headers to read
+    if (response.type === 'opaqueredirect') {
+        return { kind: 'reload' };
+    }
+
+    const redirect = response.headers.get(XHeaders.REDIRECT);
+    if (redirect !== null)
+        return { kind: 'redirect', url: redirect };
+
+    if (response.status >= 400 && response.status < 500)
+        return { kind: 'stop', status: response.status };
+
+    if (!response.ok || response.body === null)
+        return { kind: 'retry', status: response.status };
+
+    return { kind: 'read' };
+}
+
+/** 
+ * The wait before the next attempt 
+ * A backoff delay doubles (up to the cap) for the attempt after. 
+ */
+function nextWait(retry: StreamState['retry']): number {
+    const wait = retry.delay;
+    if (retry.type === 'backoff')
+        retry.delay = Math.min(retry.delay * 2, DELAY.MAX);
+    return wait;
+}
+
+/** 
+ * After a successful connect, 
+ *  backoff starts over
+ *  server-set delay stays. 
+ */
+function resetWait(retry: StreamState['retry']): void {
+    if (retry.type === 'backoff')
+        retry.delay = DELAY.MIN;
+}
+
+/** 
+ * Stops everything: 
+ *  - no more events, 
+ *  - no reconnect, the current attempt aborted. 
+ * Safe to call twice. 
+ */
+function closeStream(state: StreamState): void {
+    clearTimeout(state.timer);
+    state.timer = undefined;
+    state.closed = true;
+    state.controller?.abort();
+}
+
+/**
+ * The only way the stream ends for good on the server's say-so: 
+ *  - closes it, 
+ *  - then reports why.
+ * Does nothing if the stream is already closed, so onEnd is called at most once.
+ */
+function endStream(state: StreamState, { onEnd }: StreamCallbacks, end: StreamEnd): void {
+    if (state.closed)
+        return;
+
+    closeStream(state);
+    onEnd(end);
+}
+
+/** 
+ * Reports a failure and schedules the next attempt. 
+ * Does nothing once the stream is closed. 
+ */
+function scheduleRetry(state: StreamState, { onError }: StreamCallbacks, connect: () => Promise<void>, error: StreamError): void {
+    if (state.closed)
+        return;
+
+    onError(error);
+    state.timer = setTimeout(() => void connect(), nextWait(state.retry));
+}
+
+/** 
+ * One parsed event: 
+ *  - reserved ones end the stream, 
+ *  - the rest go to onMessage. 
+ * Dropped once closed. 
+ */
+function handleEvent(state: StreamState, callbacks: StreamCallbacks, message: Message): void {
+    // The rest of a chunk can still be parsed after the stream closed: drop it.
+    if (state.closed)
+        return;
+
+    switch (message.event) {
+        case XEvents.REDIRECT:
+            endStream(state, callbacks, { reason: 'redirect', url: message.data });
+            break;
+
+        case XEvents.REFRESH:
+            endStream(state, callbacks, { reason: 'refresh' });
+            break;
+
+        default:
+            callbacks.onMessage(message);
+            break;
+    }
+}
+
+/** 
+ * An Error's message, or anything else as a string: plain data, 
+ * safe to postMessage. 
+ */
+function errorMessage(error: unknown): string {
+    return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * Reads the body until it ends, feeding each chunk to the parser.
+ * Resolves when the server ends the response, or once the stream is closed.
+ * Rejects when the connection breaks (or is aborted).
+ */
+async function readBody(body: ReadableStream<Uint8Array>, parser: Parser, state: StreamState): Promise<void> {
+    const reader = body.getReader();
+    const decoder = new TextDecoder();
+    while (true) {
+        const { done, value } = await reader.read();
+        if (done || state.closed)
             return;
-        }
-        onError({ error, status, retrying: true });
-        const wait = serverRetry ?? delay;
-        delay = Math.min(delay * 2, MAX_DELAY);
-        timer = setTimeout(() => void connect(), wait);
+        parser.feed(decoder.decode(value, { stream: true }));
+    }
+}
+
+/** 
+ * One connect attempt, start to finish: 
+ *  - request, 
+ *  - decide, 
+ *  - then end, retry or read. 
+ */
+async function connectStream(state: StreamState, callbacks: StreamCallbacks, parser: Parser, retry: (error: StreamError) => void): Promise<void> {
+    state.controller = new AbortController();
+
+    let response: Response;
+    try {
+        response = await fetch(state.url, {
+            headers: headers(state),
+            redirect: 'manual',
+            signal: state.controller.signal,
+        });
+    } catch (error) {
+        retry({ message: errorMessage(error) });   // no response at all; after close() this does nothing
+        return;
+    }
+
+    if (state.closed)
+        return;
+
+    const outcome = classify(response);
+    switch (outcome.kind) {
+        case 'redirect':
+            endStream(state, callbacks, { reason: 'redirect', url: outcome.url });
+            return;
+
+        case 'reload':
+            endStream(state, callbacks, { reason: 'refresh' });
+            return;
+
+        case 'stop':
+            endStream(state, callbacks, { reason: 'rejected', status: outcome.status });
+            return;
+
+        case 'retry':
+            retry({ message: `SSE ${state.url} answered ${outcome.status}`, status: outcome.status });
+            return;
+
+        case 'read':
+            break;
+    }
+
+    resetWait(state.retry);
+    parser.reset();
+
+    try {
+        await readBody(response.body!, parser, state);
+    } catch (error) {
+        retry({ message: errorMessage(error) });
+        return;
+    }
+
+    retry({ message: `SSE ${state.url} ended` });
+}
+
+export type StreamOptions = {
+    lastEventId?: string; // resume from this id (failover, or the page's #sse-from)
+};
+
+export function open(url: string, callbacks: StreamCallbacks, options: StreamOptions = {}): () => void {
+    const state: StreamState = {
+        url: url,
+        closed: false,
+        lastEventId: options.lastEventId ?? null,
+        retry: { type: 'backoff', delay: DELAY.MIN },
+        controller: null,
+        timer: undefined,
     };
 
     const parser = createParser({
-        onEvent: message => {
-            // The rest of a chunk can still be parsed after close(): drop it.
-            if (closed) {
-                return;
-            }
-            if (message.event === 'x:redirect') {
-                close();
-                onEnd();
-                location.assign(message.data);
-            } else if (message.event === 'x:refresh') {
-                close();
-                onEnd();
-                location.reload();
-            } else {
-                onMessage(message);
-            }
+        onEvent: message => handleEvent(state, callbacks, message),
+        onId: id => {
+            if (state.closed)
+                return;   // the rest of a chunk after close: not ours to report
+            state.lastEventId = id;
+            callbacks.onId(id);
         },
-        onId: id => { lastEventId = id; },
-        onRetry: ms => { serverRetry = ms; },
+        onRetry: ms => {
+            state.retry = { type: 'server', delay: ms };
+        },
     });
 
-    const connect = async (): Promise<void> => {
-        controller = new AbortController();
-        const headers: Record<string, string> = { Accept: 'text/event-stream' };
-        if (lastEventId !== null) {
-            headers['Last-Event-ID'] = lastEventId;
-        }
-
-        let response: Response;
-        try {
-            response = await fetch(url, { headers, signal: controller.signal });
-        } catch (error) {
-            retry(error);
-            return;
-        }
-        if (closed) {
-            return;
-        }
-
-        const redirect = response.headers.get('X-Redirect');
-        if (redirect !== null) {
-            close();
-            onEnd();
-            location.assign(redirect);
-            return;
-        }
-        if (response.status >= 400 && response.status < 500) {
-            close();
-            onEnd();
-            onError({ error: new Error(`SSE ${url} answered ${response.status}`), status: response.status, retrying: false });
-            return;
-        }
-        if (!response.ok || response.body === null) {
-            retry(new Error(`SSE ${url} answered ${response.status}`), response.status);
-            return;
-        }
-
-        delay = FIRST_DELAY;
-        parser.reset();
-        const reader = response.body.getReader();
-        const decoder = new TextDecoder();
-        try {
-            for (;;) {
-                const { done, value } = await reader.read();
-                if (done || closed) {
-                    break;
-                }
-                parser.feed(decoder.decode(value, { stream: true }));
-            }
-        } catch (error) {
-            retry(error);
-            return;
-        }
-        retry(new Error(`SSE ${url} ended`));
-    };
+    const connect = () => connectStream(state, callbacks, parser, retry);
+    const retry = (error: StreamError) => scheduleRetry(state, callbacks, connect, error);
 
     void connect();
-    return close;
+    return () => closeStream(state);
 }
 
-type ParserCallbacks = {
-    onEvent: (message: Message) => void;
-    onId: (id: string) => void;
-    onRetry: (ms: number) => void;
-};
-
-/**
- * The SSE wire format (WHATWG HTML §9.2.6), fed in arbitrary chunks.
- * Lines end in \r\n, \n or \r; a blank line dispatches the event built so far.
- */
-function createParser(callbacks: ParserCallbacks): { feed: (chunk: string) => void; reset: () => void } {
-    let buffer = '';
-    let event = '';
-    let data = '';
-
-    const reset = (): void => {
-        buffer = '';
-        event = '';
-        data = '';
-    };
-
-    const line = (text: string): void => {
-        if (text === '') {
-            if (data !== '') {
-                callbacks.onEvent({ event: event || 'message', data: data.slice(0, -1) });
-            }
-            event = '';
-            data = '';
-            return;
-        }
-        if (text.startsWith(':')) {
-            return;
-        }
-        const colon = text.indexOf(':');
-        const field = colon === -1 ? text : text.slice(0, colon);
-        let value = colon === -1 ? '' : text.slice(colon + 1);
-        if (value.startsWith(' ')) {
-            value = value.slice(1);
-        }
-        switch (field) {
-            case 'event': event = value; break;
-            case 'data': data += value + '\n'; break;
-            case 'id': if (!value.includes('\0')) callbacks.onId(value); break;
-            case 'retry': if (/^\d+$/.test(value)) callbacks.onRetry(Number(value)); break;
-        }
-    };
-
-    const feed = (chunk: string): void => {
-        buffer += chunk;
-        for (;;) {
-            const end = buffer.search(/\r\n|\n|\r/);
-            if (end === -1) {
-                return;
-            }
-            // A lone \r at the end may be the first half of \r\n: wait for the next chunk.
-            if (buffer[end] === '\r' && end === buffer.length - 1) {
-                return;
-            }
-            const size = buffer.startsWith('\r\n', end) ? 2 : 1;
-            line(buffer.slice(0, end));
-            buffer = buffer.slice(end + size);
-        }
-    };
-
-    return { feed, reset };
-}
 
 // ---- tests (removed from the build) ----
 
-describe('createParser', () => {
-    const parse = (...chunks: string[]): { events: Message[]; ids: string[]; retries: number[] } => {
-        const out = { events: [] as Message[], ids: [] as string[], retries: [] as number[] };
-        const parser = createParser({
-            onEvent: m => out.events.push(m),
-            onId: id => out.ids.push(id),
-            onRetry: ms => out.retries.push(ms),
+describe('stream', () => {
+
+    const state = (overrides: Partial<StreamState> = {}): StreamState => ({
+        url: '/sse',
+        closed: false,
+        lastEventId: null,
+        controller: null,
+        timer: undefined,
+        retry: {
+            type: 'backoff',
+            delay: DELAY.MIN
+        },
+        ...overrides,
+    });
+
+    describe('pure helpers', () => {
+
+        describe('headers', () => {
+            test('first connect: Accept and X-Attr-Request, no Last-Event-ID', () => {
+                expect(headers(state())).toEqual({
+                    'Accept': 'text/event-stream',
+                    'X-Attr-Request': 'true',
+                });
+            });
+            test('once an id is known, it is sent as Last-Event-ID', () => {
+                expect(headers(state({ lastEventId: '17-0' }))['Last-Event-Id']).toBe('17-0');
+            });
+            test('an empty id is still an id, and is sent', () => {
+                expect(headers(state({ lastEventId: '' }))['Last-Event-Id']).toBe('');
+            });
         });
-        for (const chunk of chunks) parser.feed(chunk);
-        return out;
-    };
 
-    test('a named event', () => {
-        expect(parse('event: job:1\ndata: <p>a</p>\n\n').events).toEqual([{ event: 'job:1', data: '<p>a</p>' }]);
-    });
-    test('no event field means "message"', () => {
-        expect(parse('data: x\n\n').events).toEqual([{ event: 'message', data: 'x' }]);
-    });
-    test('several data lines join with \\n', () => {
-        expect(parse('data: <ul>\ndata: <li>a</li>\ndata: </ul>\n\n').events[0]!.data).toBe('<ul>\n<li>a</li>\n</ul>');
-    });
-    test('only one leading space is stripped; no space is fine', () => {
-        expect(parse('data:  two\n\ndata:none\n\n').events.map(e => e.data)).toEqual([' two', 'none']);
-    });
-    test('no blank line yet means no event', () => {
-        expect(parse('event: a\ndata: x\n').events).toEqual([]);
-    });
-    test('an event without data is not dispatched, and its name does not leak', () => {
-        expect(parse('event: a\n\ndata: x\n\n').events).toEqual([{ event: 'message', data: 'x' }]);
-    });
-    test('empty data line dispatches an empty string (outerHTML delete)', () => {
-        expect(parse('event: a\ndata:\n\n').events).toEqual([{ event: 'a', data: '' }]);
-    });
-    test('comments (heartbeats) are ignored', () => {
-        expect(parse(': ping\n\n').events).toEqual([]);
-    });
-    test('chunks can split anywhere', () => {
-        expect(parse('ev', 'ent: a\nda', 'ta: x', '\n', '\n').events).toEqual([{ event: 'a', data: 'x' }]);
-    });
-    test('\\r\\n and \\r line endings, \\r\\n split across chunks', () => {
-        expect(parse('data: a\r\n\r\ndata: b\r\rdata: c\r', '\n\r\n').events.map(e => e.data)).toEqual(['a', 'b', 'c']);
-    });
-    test('id and retry', () => {
-        const out = parse('id: 1700-0\nretry: 50\nretry: soon\ndata: x\n\n');
-        expect(out.ids).toEqual(['1700-0']);
-        expect(out.retries).toEqual([50]);
-    });
-    test('unknown fields are ignored', () => {
-        expect(parse('foo: bar\ndata: x\n\n').events).toEqual([{ event: 'message', data: 'x' }]);
-    });
-});
+        describe('classify', () => {
+            const stream = (): ReadableStream => new ReadableStream();
+            const opaque = (): Response => ({ type: 'opaqueredirect', status: 0, ok: false, headers: new Headers(), body: null }) as unknown as Response;
 
-describe('open', () => {
-    let messages: Message[];
-    let errors: StreamError[];
-    let ends: number;
-    let close: () => void;
+            test('2xx with a body → read', () => {
+                expect(classify(new Response(stream(), { status: 200 }))).toEqual({ kind: 'read' });
+            });
+            test('a plain 3xx (opaque redirect) → reload', () => {
+                expect(classify(opaque())).toEqual({ kind: 'reload' });
+            });
+            test('X-Attr-Redirect → redirect, whatever the status', () => {
+                for (const status of [200, 204, 401, 500]) {
+                    const response = new Response(null, { status, headers: { 'X-Attr-Redirect': '/login' } });
+                    expect(classify(response)).toEqual({ kind: 'redirect', url: '/login' });
+                }
+            });
+            test('4xx → stop, with the status', () => {
+                expect(classify(new Response(null, { status: 403 }))).toEqual({ kind: 'stop', status: 403 });
+                expect(classify(new Response(null, { status: 404 }))).toEqual({ kind: 'stop', status: 404 });
+            });
+            test('5xx → retry, with the status', () => {
+                expect(classify(new Response(null, { status: 503 }))).toEqual({ kind: 'retry', status: 503 });
+            });
+            test('2xx without a body (204) → retry', () => {
+                expect(classify(new Response(null, { status: 204 }))).toEqual({ kind: 'retry', status: 204 });
+            });
+        });
 
-    beforeEach(() => {
-        messages = [];
-        errors = [];
-        ends = 0;
-        close = () => {};
-    });
-    afterEach(() => close());
+        describe('nextWait', () => {
+            test('backoff: returns the current delay, then doubles it', () => {
+                const retry = state().retry;
+                expect([nextWait(retry), nextWait(retry), nextWait(retry)]).toEqual([1000, 2000, 4000]);
+                expect(retry.delay).toBe(8000);
+            });
+            test('backoff: never grows past the cap', () => {
+                const retry = { type: 'backoff' as const, delay: 20000, timer: undefined };
+                expect([nextWait(retry), nextWait(retry), nextWait(retry)]).toEqual([20000, 30000, 30000]);
+            });
+            test('server: always the same delay', () => {
+                const retry = { type: 'server' as const, delay: 5000, timer: undefined };
+                expect([nextWait(retry), nextWait(retry)]).toEqual([5000, 5000]);
+                expect(retry.delay).toBe(5000);
+            });
+            test('the timer is left alone', () => {
+                const timer = setTimeout(() => { }, 0);
+                const retry = { type: 'backoff' as const, delay: 1000, timer };
+                nextWait(retry);
+                expect(retry.timer).toBe(timer);
+                clearTimeout(timer);
+            });
+        });
 
-    const start = (url = '/sse'): void => {
-        close = open(url, m => messages.push(m), e => errors.push(e), () => ends++);
-    };
-    const stream = (i = 0): FakeStream => server.streams[i]!;
-
-    test('delivers events as they arrive', async () => {
-        server.routes['/sse'] = { stream: true };
-        start();
-        await settle();
-        stream().send('event: a\ndata: 1\n\n');
-        await settle();
-        stream().send('event: b\ndata: 2\n\n');
-        await settle();
-
-        expect(messages).toEqual([{ event: 'a', data: '1' }, { event: 'b', data: '2' }]);
-        expect(errors).toEqual([]);
+        describe('resetWait', () => {
+            test('backoff starts over', () => {
+                const retry = { type: 'backoff' as const, delay: 16000, timer: undefined };
+                resetWait(retry);
+                expect(retry.delay).toBe(1000);
+            });
+            test('a server delay stays', () => {
+                const retry = { type: 'server' as const, delay: 5000, timer: undefined };
+                resetWait(retry);
+                expect(retry.delay).toBe(5000);
+            });
+        });
     });
 
-    test('close() aborts the stream and nothing more arrives', async () => {
-        server.routes['/sse'] = { stream: true };
-        start();
-        await settle();
-        close();
-        await settle();
+    describe('effects', () => {
+        /** Records every callback. */
+        const recorder = (): StreamCallbacks & { messages: Message[]; ids: string[]; errors: StreamError[]; ends: StreamEnd[] } => {
+            const out = { messages: [] as Message[], ids: [] as string[], errors: [] as StreamError[], ends: [] as StreamEnd[] };
+            return {
+                ...out,
+                onMessage: m => out.messages.push(m),
+                onId: id => out.ids.push(id),
+                onError: e => out.errors.push(e),
+                onEnd: e => out.ends.push(e),
+            };
+        };
 
-        expect(stream().closed).toBe(true);
-        expect(errors).toEqual([]);
-        expect(ends).toBe(0);
-        expect(server.requested).toEqual(['/sse']);
+        describe('closeStream', () => {
+            test('marks the stream closed and aborts the current attempt', () => {
+                const controller = new AbortController();
+                const s = state({ controller });
+                closeStream(s);
+                expect(s.closed).toBe(true);
+                expect(controller.signal.aborted).toBe(true);
+            });
+            test('cancels a scheduled reconnect', async () => {
+                let ran = false;
+                const s = state({ timer: setTimeout(() => { ran = true; }, 5) });
+                closeStream(s);
+                await settle(10);
+                expect(ran).toBe(false);
+                expect(s.timer).toBeUndefined();
+            });
+            test('is safe with nothing running, and safe to call twice', () => {
+                const s = state();
+                closeStream(s);
+                closeStream(s);
+                expect(s.closed).toBe(true);
+            });
+        });
+
+        describe('endStream', () => {
+            test('closes the stream, then reports why', () => {
+                const s = state({ controller: new AbortController() });
+                const got = recorder();
+                endStream(s, got, { reason: 'rejected', status: 403 });
+                expect(s.closed).toBe(true);
+                expect(s.controller!.signal.aborted).toBe(true);
+                expect(got.ends).toEqual([{ reason: 'rejected', status: 403 }]);
+            });
+            test('the stream is already closed when onEnd runs', () => {
+                const s = state();
+                let closedDuringOnEnd: boolean | undefined;
+                endStream(s, { ...recorder(), onEnd: () => { closedDuringOnEnd = s.closed; } }, { reason: 'refresh' });
+                expect(closedDuringOnEnd).toBe(true);
+            });
+            test('onEnd is called at most once', () => {
+                const s = state();
+                const got = recorder();
+                endStream(s, got, { reason: 'refresh' });
+                endStream(s, got, { reason: 'redirect', url: '/login' });
+                expect(got.ends).toEqual([{ reason: 'refresh' }]);
+            });
+            test('a stream the caller closed does not report an end', () => {
+                const s = state();
+                const got = recorder();
+                closeStream(s);
+                endStream(s, got, { reason: 'refresh' });
+                expect(got.ends).toEqual([]);
+            });
+        });
+
+        describe('scheduleRetry', () => {
+            test('reports the error, then connects again after the wait', async () => {
+                const s = state({ retry: { type: 'server', delay: 5 } });
+                const got = recorder();
+                let connects = 0;
+                scheduleRetry(s, got, async () => { connects++; }, { message: 'down', status: 503 });
+
+                expect(got.errors).toEqual([{ message: 'down', status: 503 }]);
+                expect(connects).toBe(0);
+                await settle(5);
+                expect(connects).toBe(1);
+            });
+            test('advances the backoff', () => {
+                const s = state();
+                scheduleRetry(s, recorder(), async () => { }, { message: 'x' });
+                expect(s.retry.delay).toBe(2000);
+                closeStream(s);
+            });
+            test('the reconnect can be cancelled through state.timer', async () => {
+                const s = state({ retry: { type: 'server', delay: 5 } });
+                let connects = 0;
+                scheduleRetry(s, recorder(), async () => { connects++; }, { message: 'x' });
+                closeStream(s);
+                await settle(10);
+                expect(connects).toBe(0);
+            });
+            test('once closed: no error reported, nothing scheduled', async () => {
+                const s = state({ retry: { type: 'server', delay: 5 } });
+                const got = recorder();
+                let connects = 0;
+                closeStream(s);
+                scheduleRetry(s, got, async () => { connects++; }, { message: 'x' });
+                await settle(10);
+                expect(got.errors).toEqual([]);
+                expect(connects).toBe(0);
+                expect(s.timer).toBeUndefined();
+            });
+        });
+
+        describe('handleEvent', () => {
+            test('ordinary events go to onMessage', () => {
+                const s = state();
+                const got = recorder();
+                handleEvent(s, got, { event: 'job:1', data: '<li>a</li>' });
+                expect(got.messages).toEqual([{ event: 'job:1', data: '<li>a</li>' }]);
+                expect(s.closed).toBe(false);
+            });
+            test('the redirect event ends the stream with its data as the URL', () => {
+                const s = state();
+                const got = recorder();
+                handleEvent(s, got, { event: XEvents.REDIRECT, data: '/login' });
+                expect(got.ends).toEqual([{ reason: 'redirect', url: '/login' }]);
+                expect(got.messages).toEqual([]);
+                expect(s.closed).toBe(true);
+            });
+            test('the refresh event ends the stream; its data is ignored', () => {
+                const s = state();
+                const got = recorder();
+                handleEvent(s, got, { event: XEvents.REFRESH, data: 'anything' });
+                expect(got.ends).toEqual([{ reason: 'refresh' }]);
+                expect(got.messages).toEqual([]);
+            });
+            test('after the stream closed, every event is dropped', () => {
+                const s = state();
+                const got = recorder();
+                handleEvent(s, got, { event: XEvents.REFRESH, data: '' });
+                handleEvent(s, got, { event: 'job:1', data: 'late' });
+                handleEvent(s, got, { event: XEvents.REDIRECT, data: '/x' });
+                expect(got.messages).toEqual([]);
+                expect(got.ends).toEqual([{ reason: 'refresh' }]);
+            });
+        });
     });
 
-    test('the first connect has no Last-Event-ID', async () => {
-        server.routes['/sse'] = { stream: true };
-        start();
-        await settle();
-        expect(stream().lastEventId).toBeNull();
+    describe('readBody', () => {
+        const body = (...chunks: (string | Uint8Array)[]): ReadableStream<Uint8Array> => new ReadableStream({
+            start(c) {
+                for (const chunk of chunks) c.enqueue(typeof chunk === 'string' ? new TextEncoder().encode(chunk) : chunk);
+                c.close();
+            },
+        });
+        const collect = (): { parser: Parser; events: Message[] } => {
+            const events: Message[] = [];
+            return { events, parser: createParser({ onEvent: m => events.push(m), onId: () => {}, onRetry: () => {} }) };
+        };
+
+        test('feeds every chunk to the parser and resolves when the body ends', async () => {
+            const { parser, events } = collect();
+            await readBody(body('data: a\n\n', 'data: b\n\n'), parser, state());
+            expect(events.map(e => e.data)).toEqual(['a', 'b']);
+        });
+        test('a multi-byte character split across chunks survives', async () => {
+            const { parser, events } = collect();
+            const bytes = new TextEncoder().encode('data: é\n\n');   // é is 2 bytes
+            const cut = bytes.indexOf(0xc3) + 1;
+            await readBody(body(bytes.slice(0, cut), bytes.slice(cut)), parser, state());
+            expect(events.map(e => e.data)).toEqual(['é']);
+        });
+        test('stops feeding once the stream is closed', async () => {
+            const { parser, events } = collect();
+            await readBody(body('data: a\n\n'), parser, state({ closed: true }));
+            expect(events).toEqual([]);
+        });
+        test('rejects when the connection breaks', async () => {
+            const { parser } = collect();
+            const broken = new ReadableStream<Uint8Array>({ start(c) { c.error(new TypeError('network error')); } });
+            await expect(readBody(broken, parser, state())).rejects.toThrow(/network error/);
+        });
     });
 
-    test('reconnects after the stream ends, sending the last id', async () => {
-        server.routes['/sse'] = { stream: true };
-        start();
-        await settle();
-        stream().send('retry: 10\nid: 5-0\ndata: x\n\n');
-        await settle();
-        stream().end();
-        await settle(10);
+    describe('open', () => {
+        let got: StreamCallbacks & { messages: Message[]; ids: string[]; errors: StreamError[]; ends: StreamEnd[] };
+        let close: () => void;
 
-        expect(errors).toHaveLength(1);
-        expect(errors[0]!.retrying).toBe(true);
-        expect(server.streams).toHaveLength(2);
-        expect(stream(1).lastEventId).toBe('5-0');
-    });
+        beforeEach(() => {
+            const out = { messages: [] as Message[], ids: [] as string[], errors: [] as StreamError[], ends: [] as StreamEnd[] };
+            got = { ...out, onMessage: m => out.messages.push(m), onId: id => out.ids.push(id), onError: e => out.errors.push(e), onEnd: e => out.ends.push(e) };
+            close = () => {};
+        });
+        afterEach(() => close());
 
-    test('reconnects after the connection breaks', async () => {
-        server.routes['/sse'] = { stream: true };
-        start();
-        await settle();
-        stream().send('retry: 10\n\n');
-        await settle();
-        stream().fail();
-        await settle(10);
+        const start = (options?: StreamOptions): void => { close = open('/sse', got, options); };
+        const stream = (i = 0): FakeStream => server.streams[i]!;
 
-        expect(errors.map(e => e.retrying)).toEqual([true]);
-        expect(ends).toBe(0);
-        expect(server.streams).toHaveLength(2);
-    });
+        test('delivers events and ids as they arrive', async () => {
+            server.routes['/sse'] = { stream: true };
+            start();
+            await settle();
+            stream().send('id: 1-0\nevent: a\ndata: x\n\n');
+            await settle();
+            expect(got.messages).toEqual([{ event: 'a', data: 'x' }]);
+            expect(got.ids).toEqual(['1-0']);
+            expect(got.errors).toEqual([]);
+        });
 
-    test('5xx and network errors retry after 1s; 4xx stops for good', async () => {
-        server.routes['/sse'] = { status: 503 };
-        start();
-        await settle();
-        expect(errors).toEqual([expect.objectContaining({ status: 503, retrying: true })]);
-        expect(server.requested).toHaveLength(1);
-        expect(ends).toBe(0);
+        test('sends Accept, X-Attr-Request, and options.lastEventId on the first connect', async () => {
+            server.routes['/sse'] = { stream: true };
+            start({ lastEventId: '7-0' });
+            await settle();
+            expect(server.headers[0]!.get('Accept')).toBe('text/event-stream');
+            expect(server.headers[0]!.get('X-Attr-Request')).toBe('true');
+            expect(stream().lastEventId).toBe('7-0');
+        });
 
-        server.routes['/sse'] = { status: 403 };
-        await settle(1000);
-        expect(server.requested).toHaveLength(2);
-        expect(errors[1]).toEqual(expect.objectContaining({ status: 403, retrying: false }));
-        expect(ends).toBe(1);
+        test('reconnects after the stream ends, resuming from the last id', async () => {
+            server.routes['/sse'] = { stream: true };
+            start();
+            await settle();
+            stream().send('retry: 10\nid: 5-0\ndata: x\n\n');
+            await settle();
+            stream().end();
+            await settle(10);
+            expect(got.errors).toEqual([{ message: 'SSE /sse ended' }]);
+            expect(stream(1).lastEventId).toBe('5-0');
+        });
 
-        await settle(2000);
-        expect(server.requested).toHaveLength(2);
-    });
+        test('reconnects after the connection breaks', async () => {
+            server.routes['/sse'] = { stream: true };
+            start();
+            await settle();
+            stream().send('retry: 10\n\n');
+            await settle();
+            stream().fail();
+            await settle(10);
+            expect(got.errors).toHaveLength(1);
+            expect(server.streams).toHaveLength(2);
+        });
 
-    test('network failure retries with no status', async () => {
-        server.routes['/sse'] = { fail: true };
-        start();
-        await settle();
-        expect(errors[0]!.status).toBeUndefined();
-        expect(errors[0]!.retrying).toBe(true);
-    });
+        test('5xx retries with the status; a network failure retries without one', async () => {
+            server.routes['/sse'] = { status: 503 };
+            start();
+            await settle();
+            expect(got.errors).toEqual([{ message: 'SSE /sse answered 503', status: 503 }]);
+            close();
 
-    test('X-Redirect on connect navigates and does not retry', async () => {
-        server.routes['/sse'] = { status: 401, headers: { 'X-Redirect': '/login' } };
-        start();
-        await settle();
+            server.routes['/b'] = { fail: true };
+            close = open('/b', got);
+            await settle();
+            expect(got.errors[1]!.status).toBeUndefined();
+            expect(typeof got.errors[1]!.message).toBe('string');
+        });
 
-        expect(page.navigated).toEqual(['/login']);
-        expect(errors).toEqual([]);
-        expect(ends).toBe(1);
-    });
+        test('4xx ends the stream: onEnd rejected, no error, no retry', async () => {
+            server.routes['/sse'] = { status: 403 };
+            start();
+            await settle(1100);
+            expect(got.ends).toEqual([{ reason: 'rejected', status: 403 }]);
+            expect(got.errors).toEqual([]);
+            expect(server.requested).toEqual(['/sse']);
+        });
 
-    test('x:redirect and x:refresh events close the stream and never reach onMessage', async () => {
-        server.routes['/sse'] = { stream: true };
-        start();
-        await settle();
-        stream().send('event: x:redirect\ndata: /login\n\ndata: after\n\n');
-        await settle();
-        expect(page.navigated).toEqual(['/login']);
-        expect(messages).toEqual([]);
-        expect(stream().closed).toBe(true);
-        expect(ends).toBe(1);
+        test('X-Attr-Redirect ends the stream with the URL; nothing navigates', async () => {
+            server.routes['/sse'] = { status: 204, headers: { 'X-Attr-Redirect': '/login' } };
+            start();
+            await settle();
+            expect(got.ends).toEqual([{ reason: 'redirect', url: '/login' }]);
+            expect(page.navigated).toEqual([]);
+        });
 
-        start();
-        await settle();
-        stream(1).send('event: x:refresh\ndata: now\n\n');
-        await settle();
-        expect(page.reloads).toBe(1);
-        expect(messages).toEqual([]);
-        expect(ends).toBe(2);
+        test('a plain 3xx ends the stream as refresh; nothing reloads', async () => {
+            server.routes['/sse'] = { redirect: '/login' };
+            start();
+            await settle();
+            expect(got.ends).toEqual([{ reason: 'refresh' }]);
+            expect(page.reloads).toBe(0);
+        });
+
+        test('the redirect event ends the stream; the rest of the chunk is dropped', async () => {
+            server.routes['/sse'] = { stream: true };
+            start();
+            await settle();
+            stream().send(`event: ${XEvents.REDIRECT}\ndata: /login\n\nid: 9-0\ndata: late\n\n`);
+            await settle();
+            expect(got.ends).toEqual([{ reason: 'redirect', url: '/login' }]);
+            expect(got.messages).toEqual([]);
+            expect(got.ids).toEqual([]);
+            expect(stream().closed).toBe(true);
+        });
+
+        test('close() is quiet: no error, no end, no reconnect', async () => {
+            server.routes['/sse'] = { stream: true };
+            start();
+            await settle();
+            close();
+            await settle(1100);
+            expect(stream().closed).toBe(true);
+            expect(got.errors).toEqual([]);
+            expect(got.ends).toEqual([]);
+            expect(server.requested).toEqual(['/sse']);
+        });
     });
 });

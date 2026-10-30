@@ -1,6 +1,6 @@
 {
   "name": "@sneze/x-attributes",
-  "version": "0.1.0",
+  "version": "0.3.0",
   "description": "Minimal htmx-style x-* attribute library",
   "type": "module",
   "exports": {
