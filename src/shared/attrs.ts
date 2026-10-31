@@ -1,15 +1,16 @@
 export enum Verbs {
+    DELETE = 'x-delete',
     GET = 'x-get',
+    PATCH = 'x-patch', 
     POST = 'x-post',
     PUT = 'x-put', 
-    PATCH = 'x-patch', 
-    DELETE = 'x-delete',
 }
 
 export enum Modifiers {
+    HEADERS = 'x-headers',
+    INCLUDE = 'x-include',
+    SWAP = 'x-swap',
     TRIGGER = 'x-trigger',
     TARGET = 'x-target',
-    SWAP = 'x-swap',
-    INCLUDE = 'x-include',
     VALS = 'x-vals',
 }

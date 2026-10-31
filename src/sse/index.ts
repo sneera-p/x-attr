@@ -17,5 +17,4 @@ function subscriber(): Subscriber {
     return tab;
 }
 
-export const subscribe: Subscriber['subscribe'] = (url, event, handler, onError) =>
-    subscriber().subscribe(url, event, handler, onError);
+export const subscribe: Subscriber['subscribe'] = (...args) => subscriber().subscribe(...args);

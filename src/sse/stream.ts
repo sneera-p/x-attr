@@ -2,6 +2,23 @@ import { XEvents } from "../shared/events";
 import { XHeaders } from "../shared/headers";
 import { type Message, type Parser, createParser } from "./parse";
 
+/** Identifies one SSE connection: its URL and the headers it is opened with. Made by streamKey(). */
+export type StreamKey = string & { readonly __brand: 'StreamKey' };
+
+/** Request headers for a stream, beyond the library's own. */
+export type StreamHeaders = Record<string, string>;
+
+/**
+ * The key of the connection for `url` opened with `headers`. Header names are compared
+ * without case and in any order, so the same headers written differently share a connection.
+ */
+export function streamKey(url: string, headers: StreamHeaders): StreamKey {
+    const canonical = Object.entries(headers)
+        .map(([name, value]) => [name.toLowerCase(), value] as const)
+        .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+    return JSON.stringify([url, canonical]) as StreamKey;
+}
+
 type StreamError = {
     message: string;
     status?: number;    // HTTP status, when the server answered at all.
@@ -14,6 +31,7 @@ export type StreamEnd =
 
 type StreamState = {
     url: string,
+    headers: StreamHeaders,
     closed: boolean,
     lastEventId: string | null,
     retry: {
@@ -42,6 +60,12 @@ export type StreamCallbacks = {
     onEnd: (end: StreamEnd) => void,
 };
 
+
+export type StreamOptions = {
+    headers: StreamHeaders;
+    lastEventId?: string; // resume from this id (failover, or the page's #sse-from)
+};
+
 const DELAY = {
     MIN: 1000,
     MAX: 30000,
@@ -53,16 +77,17 @@ const DELAY = {
  *  - X-Attr-Request
  *  - Last-Event-ID (once an id is known)
  */
-function headers(state: StreamState): Record<string, string> {
-    const headers: Record<string, string> = {
+function headers({ headers, lastEventId }: StreamState): Record<string, string> {
+    const list: Record<string, string> = {
+        ...headers,
         'Accept': 'text/event-stream',
         [XHeaders.REQUEST]: 'true',
     };
 
-    if (state.lastEventId !== null)
-        headers[XHeaders.LAST_EVENT_ID] = state.lastEventId;
+    if (lastEventId !== null)
+        list[XHeaders.LAST_EVENT_ID] = lastEventId;
 
-    return headers;
+    return list;
 }
 
 function classify(response: Response): StreamOutcome {
@@ -253,13 +278,10 @@ async function connectStream(state: StreamState, callbacks: StreamCallbacks, par
     retry({ message: `SSE ${state.url} ended` });
 }
 
-export type StreamOptions = {
-    lastEventId?: string; // resume from this id (failover, or the page's #sse-from)
-};
-
-export function open(url: string, callbacks: StreamCallbacks, options: StreamOptions = {}): () => void {
+export function open(url: string, callbacks: StreamCallbacks, options: StreamOptions = { headers: {} }): () => void {
     const state: StreamState = {
         url: url,
+        headers: options.headers,
         closed: false,
         lastEventId: options.lastEventId ?? null,
         retry: { type: 'backoff', delay: DELAY.MIN },
@@ -291,9 +313,10 @@ export function open(url: string, callbacks: StreamCallbacks, options: StreamOpt
 // ---- tests (removed from the build) ----
 
 describe('stream', () => {
-
+ 
     const state = (overrides: Partial<StreamState> = {}): StreamState => ({
         url: '/sse',
+        headers: {},
         closed: false,
         lastEventId: null,
         controller: null,
@@ -304,9 +327,27 @@ describe('stream', () => {
         },
         ...overrides,
     });
-
+ 
     describe('pure helpers', () => {
-
+ 
+        describe('streamKey', () => {
+            test('the same URL and headers give the same key, whatever the order and case of names', () => {
+                expect(streamKey('/live', { 'X-Tenant': '7', 'X-A': '1' })).toBe(streamKey('/live', { 'x-a': '1', 'x-tenant': '7' }));
+            });
+            test('different header values give different keys', () => {
+                expect(streamKey('/live', { 'X-Tenant': '7' })).not.toBe(streamKey('/live', { 'X-Tenant': '9' }));
+            });
+            test('different URLs give different keys', () => {
+                expect(streamKey('/a', {})).not.toBe(streamKey('/b', {}));
+            });
+            test('no headers is its own key, different from any header set', () => {
+                expect(streamKey('/live', {})).not.toBe(streamKey('/live', { 'X-A': '' }));
+            });
+            test('values cannot run into each other', () => {
+                expect(streamKey('/live', { a: 'b,c' })).not.toBe(streamKey('/live', { a: 'b', c: '' }));
+            });
+        });
+ 
         describe('headers', () => {
             test('first connect: Accept and X-Attr-Request, no Last-Event-ID', () => {
                 expect(headers(state())).toEqual({
@@ -320,12 +361,18 @@ describe('stream', () => {
             test('an empty id is still an id, and is sent', () => {
                 expect(headers(state({ lastEventId: '' }))['Last-Event-Id']).toBe('');
             });
+            test('the stream\'s own headers are sent too', () => {
+                expect(headers(state({ headers: { 'X-Tenant': '7' } }))['X-Tenant']).toBe('7');
+            });
+            test('the library\'s headers win over the stream\'s', () => {
+                expect(headers(state({ headers: { 'Accept': 'text/html' } }))['Accept']).toBe('text/event-stream');
+            });
         });
-
+ 
         describe('classify', () => {
             const stream = (): ReadableStream => new ReadableStream();
             const opaque = (): Response => ({ type: 'opaqueredirect', status: 0, ok: false, headers: new Headers(), body: null }) as unknown as Response;
-
+ 
             test('2xx with a body → read', () => {
                 expect(classify(new Response(stream(), { status: 200 }))).toEqual({ kind: 'read' });
             });
@@ -349,7 +396,7 @@ describe('stream', () => {
                 expect(classify(new Response(null, { status: 204 }))).toEqual({ kind: 'retry', status: 204 });
             });
         });
-
+ 
         describe('nextWait', () => {
             test('backoff: returns the current delay, then doubles it', () => {
                 const retry = state().retry;
@@ -357,37 +404,30 @@ describe('stream', () => {
                 expect(retry.delay).toBe(8000);
             });
             test('backoff: never grows past the cap', () => {
-                const retry = { type: 'backoff' as const, delay: 20000, timer: undefined };
+                const retry = { type: 'backoff' as const, delay: 20000 };
                 expect([nextWait(retry), nextWait(retry), nextWait(retry)]).toEqual([20000, 30000, 30000]);
             });
             test('server: always the same delay', () => {
-                const retry = { type: 'server' as const, delay: 5000, timer: undefined };
+                const retry = { type: 'server' as const, delay: 5000 };
                 expect([nextWait(retry), nextWait(retry)]).toEqual([5000, 5000]);
                 expect(retry.delay).toBe(5000);
             });
-            test('the timer is left alone', () => {
-                const timer = setTimeout(() => { }, 0);
-                const retry = { type: 'backoff' as const, delay: 1000, timer };
-                nextWait(retry);
-                expect(retry.timer).toBe(timer);
-                clearTimeout(timer);
-            });
         });
-
+ 
         describe('resetWait', () => {
             test('backoff starts over', () => {
-                const retry = { type: 'backoff' as const, delay: 16000, timer: undefined };
+                const retry = { type: 'backoff' as const, delay: 16000 };
                 resetWait(retry);
                 expect(retry.delay).toBe(1000);
             });
             test('a server delay stays', () => {
-                const retry = { type: 'server' as const, delay: 5000, timer: undefined };
+                const retry = { type: 'server' as const, delay: 5000 };
                 resetWait(retry);
                 expect(retry.delay).toBe(5000);
             });
         });
     });
-
+ 
     describe('effects', () => {
         /** Records every callback. */
         const recorder = (): StreamCallbacks & { messages: Message[]; ids: string[]; errors: StreamError[]; ends: StreamEnd[] } => {
@@ -400,7 +440,7 @@ describe('stream', () => {
                 onEnd: e => out.ends.push(e),
             };
         };
-
+ 
         describe('closeStream', () => {
             test('marks the stream closed and aborts the current attempt', () => {
                 const controller = new AbortController();
@@ -424,7 +464,7 @@ describe('stream', () => {
                 expect(s.closed).toBe(true);
             });
         });
-
+ 
         describe('endStream', () => {
             test('closes the stream, then reports why', () => {
                 const s = state({ controller: new AbortController() });
@@ -455,14 +495,14 @@ describe('stream', () => {
                 expect(got.ends).toEqual([]);
             });
         });
-
+ 
         describe('scheduleRetry', () => {
             test('reports the error, then connects again after the wait', async () => {
                 const s = state({ retry: { type: 'server', delay: 5 } });
                 const got = recorder();
                 let connects = 0;
                 scheduleRetry(s, got, async () => { connects++; }, { message: 'down', status: 503 });
-
+ 
                 expect(got.errors).toEqual([{ message: 'down', status: 503 }]);
                 expect(connects).toBe(0);
                 await settle(5);
@@ -494,7 +534,7 @@ describe('stream', () => {
                 expect(s.timer).toBeUndefined();
             });
         });
-
+ 
         describe('handleEvent', () => {
             test('ordinary events go to onMessage', () => {
                 const s = state();
@@ -529,7 +569,7 @@ describe('stream', () => {
             });
         });
     });
-
+ 
     describe('readBody', () => {
         const body = (...chunks: (string | Uint8Array)[]): ReadableStream<Uint8Array> => new ReadableStream({
             start(c) {
@@ -541,7 +581,7 @@ describe('stream', () => {
             const events: Message[] = [];
             return { events, parser: createParser({ onEvent: m => events.push(m), onId: () => {}, onRetry: () => {} }) };
         };
-
+ 
         test('feeds every chunk to the parser and resolves when the body ends', async () => {
             const { parser, events } = collect();
             await readBody(body('data: a\n\n', 'data: b\n\n'), parser, state());
@@ -565,21 +605,21 @@ describe('stream', () => {
             await expect(readBody(broken, parser, state())).rejects.toThrow(/network error/);
         });
     });
-
+ 
     describe('open', () => {
         let got: StreamCallbacks & { messages: Message[]; ids: string[]; errors: StreamError[]; ends: StreamEnd[] };
         let close: () => void;
-
+ 
         beforeEach(() => {
             const out = { messages: [] as Message[], ids: [] as string[], errors: [] as StreamError[], ends: [] as StreamEnd[] };
             got = { ...out, onMessage: m => out.messages.push(m), onId: id => out.ids.push(id), onError: e => out.errors.push(e), onEnd: e => out.ends.push(e) };
             close = () => {};
         });
         afterEach(() => close());
-
+ 
         const start = (options?: StreamOptions): void => { close = open('/sse', got, options); };
         const stream = (i = 0): FakeStream => server.streams[i]!;
-
+ 
         test('delivers events and ids as they arrive', async () => {
             server.routes['/sse'] = { stream: true };
             start();
@@ -590,16 +630,27 @@ describe('stream', () => {
             expect(got.ids).toEqual(['1-0']);
             expect(got.errors).toEqual([]);
         });
-
+ 
         test('sends Accept, X-Attr-Request, and options.lastEventId on the first connect', async () => {
             server.routes['/sse'] = { stream: true };
-            start({ lastEventId: '7-0' });
+            start({ headers: {}, lastEventId: '7-0' });
             await settle();
             expect(server.headers[0]!.get('Accept')).toBe('text/event-stream');
             expect(server.headers[0]!.get('X-Attr-Request')).toBe('true');
             expect(stream().lastEventId).toBe('7-0');
         });
-
+ 
+        test('sends options.headers on every connect', async () => {
+            server.routes['/sse'] = { stream: true };
+            start({ headers: { 'X-Tenant': '7' } });
+            await settle();
+            stream().send('retry: 10\n\n');
+            await settle();
+            stream().end();
+            await settle(10);
+            expect(server.headers.map(h => h.get('X-Tenant'))).toEqual(['7', '7']);
+        });
+ 
         test('reconnects after the stream ends, resuming from the last id', async () => {
             server.routes['/sse'] = { stream: true };
             start();
@@ -611,7 +662,7 @@ describe('stream', () => {
             expect(got.errors).toEqual([{ message: 'SSE /sse ended' }]);
             expect(stream(1).lastEventId).toBe('5-0');
         });
-
+ 
         test('reconnects after the connection breaks', async () => {
             server.routes['/sse'] = { stream: true };
             start();
@@ -623,21 +674,21 @@ describe('stream', () => {
             expect(got.errors).toHaveLength(1);
             expect(server.streams).toHaveLength(2);
         });
-
+ 
         test('5xx retries with the status; a network failure retries without one', async () => {
             server.routes['/sse'] = { status: 503 };
             start();
             await settle();
             expect(got.errors).toEqual([{ message: 'SSE /sse answered 503', status: 503 }]);
             close();
-
+ 
             server.routes['/b'] = { fail: true };
             close = open('/b', got);
             await settle();
             expect(got.errors[1]!.status).toBeUndefined();
             expect(typeof got.errors[1]!.message).toBe('string');
         });
-
+ 
         test('4xx ends the stream: onEnd rejected, no error, no retry', async () => {
             server.routes['/sse'] = { status: 403 };
             start();
@@ -646,7 +697,7 @@ describe('stream', () => {
             expect(got.errors).toEqual([]);
             expect(server.requested).toEqual(['/sse']);
         });
-
+ 
         test('X-Attr-Redirect ends the stream with the URL; nothing navigates', async () => {
             server.routes['/sse'] = { status: 204, headers: { 'X-Attr-Redirect': '/login' } };
             start();
@@ -654,7 +705,7 @@ describe('stream', () => {
             expect(got.ends).toEqual([{ reason: 'redirect', url: '/login' }]);
             expect(page.navigated).toEqual([]);
         });
-
+ 
         test('a plain 3xx ends the stream as refresh; nothing reloads', async () => {
             server.routes['/sse'] = { redirect: '/login' };
             start();
@@ -662,7 +713,7 @@ describe('stream', () => {
             expect(got.ends).toEqual([{ reason: 'refresh' }]);
             expect(page.reloads).toBe(0);
         });
-
+ 
         test('the redirect event ends the stream; the rest of the chunk is dropped', async () => {
             server.routes['/sse'] = { stream: true };
             start();
@@ -674,7 +725,7 @@ describe('stream', () => {
             expect(got.ids).toEqual([]);
             expect(stream().closed).toBe(true);
         });
-
+ 
         test('close() is quiet: no error, no end, no reconnect', async () => {
             server.routes['/sse'] = { stream: true };
             start();

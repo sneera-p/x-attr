@@ -1,41 +1,15 @@
 import { Modifiers } from '../shared/attrs';
 import type { Entry } from '../shared/form';
-
-/** 
- * @throws Error on invalid JSON, a non-object, or a nested / null value
- */
-function parseJsonVals(text: string): Entry[] {
-    let parsed: unknown;
-    try {
-        parsed = JSON.parse(text);
-    } catch {
-        throw new Error(`x-vals is not valid JSON: ${text}`);
-    }
-
-    
-    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
-        throw new Error(`x-vals must be a JSON object: ${text}`);
-    }
-
-    return Object.entries(parsed).map(([key, value]) => {
-        if (typeof value !== 'string' && typeof value !== 'number' && typeof value !== 'boolean') {
-            throw new Error(`x-vals "${key}" must be a string, number or boolean: ${text}`);
-        }
-        return [key, String(value)];
-    });
-}
+import { parsePairs } from '../shared/parse';
 
 export function extractVals(el: Element): Entry[] {
-    const text = el.getAttribute(Modifiers.VALS)?.trim();
-    if (text === undefined || text === '') {
+    const text = el.getAttribute(Modifiers.VALS);
+    if (text === null)
         return [];
-    }
-    return text.startsWith('{') 
-        ? parseJsonVals(text) 
-        : [...new URLSearchParams(text)];
+    
+    return parsePairs(text, Modifiers.VALS);
 }
 
-// ---- tests (removed from the build) ----
 
 // ---- tests (removed from the build) ----
 

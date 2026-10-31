@@ -10,6 +10,7 @@ import { Verbs } from '../shared/attrs';
 import { cleanup, onCleanup } from '../shared/cleanup';
 import { XEvents } from '../shared/events';
 import { collectValues, toQuery } from '../shared/values';
+import { extractHeaders } from '../modifiers/headers';
 
 type Reprocess = (node: Node) => void;
 
@@ -40,6 +41,7 @@ function subscribeTo(node: Element, url: string, event: string, reprocess: Repro
     const streamUrl = withQuery(url, toQuery(collectValues(node, extractInclude(node), extractVals(node))));
     const unsubscribe = subscribe(
         streamUrl,
+        extractHeaders(node),
         event,
         html => {
             if (!node.isConnected)

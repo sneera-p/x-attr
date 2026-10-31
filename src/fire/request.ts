@@ -5,6 +5,7 @@ import { extractVals } from '../modifiers/vals';
 import { XEvents } from '../shared/events';
 import { XHeaders } from '../shared/headers';
 import { collectValues, toFormData, toQuery } from '../shared/values';
+import { extractHeaders } from '../modifiers/headers';
 
 export type Method = 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE';
 
@@ -43,6 +44,7 @@ export function emit(el: Element, name: string, detail: object): void {
 function buildRequest(state: RequestState, signal: AbortSignal): { url: string; init: RequestInit } {
     const entries = collectValues(state.node, extractInclude(state.node), extractVals(state.node));
     const headers: Record<string, string> = {
+        ...extractHeaders(state.node),
         'Accept': 'text/html',
         [XHeaders.REQUEST]: 'true',
     };

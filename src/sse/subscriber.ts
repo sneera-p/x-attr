@@ -1,4 +1,5 @@
-import type { BrokerMessage, SubscriberTransport, TabId } from './transport';
+import { streamKey, type StreamHeaders, type StreamKey } from './stream';
+import type { TabId, SubscriberTransport, BrokerMessage } from './transport';
 
 /** What a subscription's onError receives. */
 export type SubscriptionError = {
@@ -11,6 +12,7 @@ export type SubscriptionError = {
 
 /** One element's interest in one event of one stream. */
 type Subscription = {
+    stream: StreamKey;
     url: string;
     event: string;
     handler: (data: string) => void;
@@ -22,97 +24,94 @@ type SubscriberState = {
     tab: TabId;
     transport: SubscriberTransport;
     subscriptions: Set<Subscription>;
-    /** How many subscriptions this tab has per URL; the broker only hears about 0 → 1 and 1 → 0. */
-    counts: Map<string, number>;
+    /** How many subscriptions this tab has per stream; the broker only hears about 0 → 1 and 1 → 0. */
+    counts: Map<StreamKey, number>;
 };
 
 export type Subscriber = {
-    /** Listens for `event` on the stream at `url`. Returns a function that stops listening (safe to call twice). */
-    subscribe: (url: string, event: string, handler: (data: string) => void, onError: (error: SubscriptionError) => void) => () => void;
+    /**
+     * Listens for `event` on the stream at `url`, opened with `headers`.
+     * Returns a function that stops listening (safe to call twice).
+     */
+    subscribe: (url: string, headers: StreamHeaders, event: string, handler: (data: string) => void, onError: (error: SubscriptionError) => void) => () => void;
     /** This tab is going away: the broker drops everything it wanted. */
     leave: () => void;
 };
 
-/** The URL as the broker keys it: absolute, so it means the same in every tab and in a worker. */
+/** The URL as the broker sees it: absolute, so it means the same in every tab and in a worker. */
 function absolute(url: string): string {
     return new URL(url, location.href).href;
 }
 
-/** Every subscription on `url`. A copy, so callers may add or remove while iterating. */
-function on(state: SubscriberState, url: string): Subscription[] {
-    return [...state.subscriptions].filter(subscription => subscription.url === url);
+/** Every subscription on `stream`. A copy, so callers may add or remove while iterating. */
+function on(state: SubscriberState, stream: StreamKey): Subscription[] {
+    return [...state.subscriptions].filter(subscription => subscription.stream === stream);
 }
 
-/** The stream at `url` is gone: drop its subscriptions here, without telling the broker (it already forgot it). */
-function drop(state: SubscriberState, url: string): Subscription[] {
-    const dropped = on(state, url);
-    for (const subscription of dropped) {
+/** The stream is gone: drop its subscriptions here, without telling the broker (it already forgot it). */
+function drop(state: SubscriberState, stream: StreamKey): Subscription[] {
+    const dropped = on(state, stream);
+    for (const subscription of dropped)
         state.subscriptions.delete(subscription);
-    }
-    state.counts.delete(url);
+    state.counts.delete(stream);
     return dropped;
 }
 
-function add(state: SubscriberState, subscription: Subscription): void {
+function add(state: SubscriberState, subscription: Subscription, headers: StreamHeaders): void {
     state.subscriptions.add(subscription);
-    const count = (state.counts.get(subscription.url) ?? 0) + 1;
-    state.counts.set(subscription.url, count);
-    if (count === 1) {
-        state.transport.postMessage({ type: 'subscribe', tab: state.tab, url: subscription.url });
-    }
+    const count = (state.counts.get(subscription.stream) ?? 0) + 1;
+    state.counts.set(subscription.stream, count);
+    if (count === 1)
+        state.transport.postMessage({ type: 'subscribe', tab: state.tab, stream: subscription.stream, url: subscription.url, headers });
 }
 
 function remove(state: SubscriberState, subscription: Subscription): void {
     // Already gone: unsubscribed before, or dropped when its stream ended.
-    if (!state.subscriptions.delete(subscription)) {
+    if (!state.subscriptions.delete(subscription))
         return;
-    }
-    const count = (state.counts.get(subscription.url) ?? 1) - 1;
+
+    const count = (state.counts.get(subscription.stream) ?? 1) - 1;
     if (count > 0) {
-        state.counts.set(subscription.url, count);
+        state.counts.set(subscription.stream, count);
         return;
     }
-    state.counts.delete(subscription.url);
-    state.transport.postMessage({ type: 'unsubscribe', tab: state.tab, url: subscription.url });
+    state.counts.delete(subscription.stream);
+    state.transport.postMessage({ type: 'unsubscribe', tab: state.tab, stream: subscription.stream });
 }
 
 /** Handles one message from the broker. */
 function receive(state: SubscriberState, message: BrokerMessage): void {
     switch (message.type) {
         case 'event':
-            for (const subscription of on(state, message.url)) {
-                if (subscription.event === message.event) {
+            for (const subscription of on(state, message.stream))
+                if (subscription.event === message.event)
                     subscription.handler(message.data);
-                }
-            }
             break;
 
         case 'error':
-            for (const subscription of on(state, message.url)) {
+            for (const subscription of on(state, message.stream))
                 subscription.onError({ message: message.message, status: message.status, retrying: true });
-            }
             break;
 
         case 'rejected':
-            for (const subscription of drop(state, message.url)) {
-                subscription.onError({ message: `${message.url} answered ${message.status}`, status: message.status, retrying: false });
-            }
+            for (const subscription of drop(state, message.stream))
+                subscription.onError({ message: `${subscription.url} answered ${message.status}`, status: message.status, retrying: false });
             break;
 
         case 'redirect':
-            drop(state, message.url);
+            drop(state, message.stream);
             location.assign(message.to);
             break;
 
         case 'refresh':
-            drop(state, message.url);
+            drop(state, message.stream);
             location.reload();
             break;
     }
 }
 
 /**
- * This tab's side of SSE: keeps the handlers, tells the broker which URLs the tab
+ * This tab's side of SSE: keeps the handlers, tells the broker which streams the tab
  * needs, calls the right handlers when events arrive, and does what only a page
  * can do (navigate, reload).
  */
@@ -127,9 +126,10 @@ export function createSubscriber(transport: SubscriberTransport, tab: TabId = cr
     transport.onMessage(message => receive(state, message));
 
     return {
-        subscribe: (url, event, handler, onError) => {
-            const subscription: Subscription = { url: absolute(url), event, handler, onError };
-            add(state, subscription);
+        subscribe: (url, headers, event, handler, onError) => {
+            const absoluteUrl = absolute(url);
+            const subscription: Subscription = { stream: streamKey(absoluteUrl, headers), url: absoluteUrl, event, handler, onError };
+            add(state, subscription, headers);
             return () => remove(state, subscription);
         },
         leave: () => {
@@ -143,12 +143,13 @@ export function createSubscriber(transport: SubscriberTransport, tab: TabId = cr
 describe('subscriber', () => {
     const tab = '00000000-0000-0000-0000-00000000000a' as TabId;
     const url = 'http://localhost/live';
-
+    const stream = streamKey(url, {});
+ 
     /** A fake transport: records what the subscriber posts; the test delivers broker messages. */
     let posted: unknown[];
     let deliver: (message: BrokerMessage) => void;
     let subscriber: Subscriber;
-
+ 
     beforeEach(() => {
         posted = [];
         subscriber = createSubscriber({
@@ -156,128 +157,136 @@ describe('subscriber', () => {
             onMessage: listener => { deliver = listener; },
         }, tab);
     });
-
+ 
     const noop = (): void => {};
-
+    const subscribe = (u: string, event: string, handler: (data: string) => void = noop, onError: (e: SubscriptionError) => void = noop, headers: StreamHeaders = {}): (() => void) =>
+        subscriber.subscribe(u, headers, event, handler, onError);
+ 
     describe('telling the broker', () => {
-        test('the first subscription to a URL subscribes the tab', () => {
-            subscriber.subscribe(url, 'a', noop, noop);
-            expect(posted).toEqual([{ type: 'subscribe', tab, url }]);
+        test('the first subscription to a stream subscribes the tab, with its URL and headers', () => {
+            subscribe(url, 'a', noop, noop, { 'X-Tenant': '7' });
+            expect(posted).toEqual([{ type: 'subscribe', tab, stream: streamKey(url, { 'X-Tenant': '7' }), url, headers: { 'X-Tenant': '7' } }]);
         });
-        test('more subscriptions to the same URL tell the broker nothing, whatever the event', () => {
-            subscriber.subscribe(url, 'a', noop, noop);
-            subscriber.subscribe(url, 'a', noop, noop);
-            subscriber.subscribe(url, 'b', noop, noop);
+        test('more subscriptions to the same stream tell the broker nothing, whatever the event', () => {
+            subscribe(url, 'a');
+            subscribe(url, 'a');
+            subscribe(url, 'b');
             expect(posted).toHaveLength(1);
         });
-        test('only the last unsubscribe from a URL unsubscribes the tab', () => {
-            const one = subscriber.subscribe(url, 'a', noop, noop);
-            const two = subscriber.subscribe(url, 'b', noop, noop);
+        test('the same URL with different headers is a separate stream', () => {
+            subscribe(url, 'a', noop, noop, { 'X-Tenant': '7' });
+            subscribe(url, 'a', noop, noop, { 'X-Tenant': '9' });
+            expect(posted).toHaveLength(2);
+        });
+        test('only the last unsubscribe from a stream unsubscribes the tab', () => {
+            const one = subscribe(url, 'a');
+            const two = subscribe(url, 'b');
             one();
             expect(posted).toHaveLength(1);
             two();
-            expect(posted).toEqual([{ type: 'subscribe', tab, url }, { type: 'unsubscribe', tab, url }]);
+            expect(posted.at(-1)).toEqual({ type: 'unsubscribe', tab, stream });
         });
         test('unsubscribing twice counts once', () => {
-            const one = subscriber.subscribe(url, 'a', noop, noop);
-            subscriber.subscribe(url, 'a', noop, noop);
+            const one = subscribe(url, 'a');
+            subscribe(url, 'a');
             one();
             one();
             expect(posted).toHaveLength(1);
         });
-        test('relative URLs are made absolute, so equal URLs are one key', () => {
-            subscriber.subscribe('/live', 'a', noop, noop);
-            subscriber.subscribe('http://localhost/live', 'a', noop, noop);
-            expect(posted).toEqual([{ type: 'subscribe', tab, url: 'http://localhost/live' }]);
+        test('relative URLs are made absolute, so equal URLs are one stream', () => {
+            subscribe('/live', 'a');
+            subscribe('http://localhost/live', 'a');
+            expect(posted).toEqual([{ type: 'subscribe', tab, stream, url, headers: {} }]);
         });
         test('leave tells the broker the whole tab is going', () => {
             subscriber.leave();
             expect(posted).toEqual([{ type: 'leave', tab }]);
         });
     });
-
+ 
     describe('events', () => {
-        test('go to the subscriptions with that URL and event only', () => {
+        test('go to the subscriptions with that stream and event only', () => {
             const got: string[] = [];
-            subscriber.subscribe(url, 'a', data => got.push(`a1 ${data}`), noop);
-            subscriber.subscribe(url, 'a', data => got.push(`a2 ${data}`), noop);
-            subscriber.subscribe(url, 'b', data => got.push(`b ${data}`), noop);
-            subscriber.subscribe(`${url}?x=1`, 'a', data => got.push(`other ${data}`), noop);
-
-            deliver({ type: 'event', url, event: 'a', data: 'x' });
+            subscribe(url, 'a', data => got.push(`a1 ${data}`));
+            subscribe(url, 'a', data => got.push(`a2 ${data}`));
+            subscribe(url, 'b', data => got.push(`b ${data}`));
+            subscribe(`${url}?x=1`, 'a', data => got.push(`other url ${data}`));
+            subscribe(url, 'a', data => got.push(`other headers ${data}`), noop, { 'X-A': '1' });
+ 
+            deliver({ type: 'event', stream, event: 'a', data: 'x' });
             expect(got).toEqual(['a1 x', 'a2 x']);
         });
         test('an unsubscribed handler is not called', () => {
             const got: string[] = [];
-            const off = subscriber.subscribe(url, 'a', data => got.push(data), noop);
+            const off = subscribe(url, 'a', data => got.push(data));
             off();
-            deliver({ type: 'event', url, event: 'a', data: 'x' });
+            deliver({ type: 'event', stream, event: 'a', data: 'x' });
             expect(got).toEqual([]);
         });
         test('a handler that replaces itself (outerHTML) runs once, and the new one waits for the next event', () => {
             const got: string[] = [];
             const listen = (): void => {
-                const off = subscriber.subscribe(url, 'a', data => { got.push(data); listen(); off(); }, noop);
+                const off = subscribe(url, 'a', data => { got.push(data); listen(); off(); });
             };
             listen();
-            deliver({ type: 'event', url, event: 'a', data: '1' });
-            deliver({ type: 'event', url, event: 'a', data: '2' });
+            deliver({ type: 'event', stream, event: 'a', data: '1' });
+            deliver({ type: 'event', stream, event: 'a', data: '2' });
             expect(got).toEqual(['1', '2']);
-            expect(posted).toEqual([{ type: 'subscribe', tab, url }]);
+            expect(posted).toHaveLength(1);
         });
     });
-
+ 
     describe('errors and ends', () => {
-        test('error: every subscription on the URL hears it, retrying, and stays', () => {
+        test('error: every subscription on the stream hears it, retrying, and stays', () => {
             const errors: SubscriptionError[] = [];
             const got: string[] = [];
-            subscriber.subscribe(url, 'a', data => got.push(data), e => errors.push(e));
-            subscriber.subscribe(url, 'b', noop, e => errors.push(e));
-
-            deliver({ type: 'error', url, message: 'down', status: 503 });
+            subscribe(url, 'a', data => got.push(data), e => errors.push(e));
+            subscribe(url, 'b', noop, e => errors.push(e));
+ 
+            deliver({ type: 'error', stream, message: 'down', status: 503 });
             expect(errors).toEqual([
                 { message: 'down', status: 503, retrying: true },
                 { message: 'down', status: 503, retrying: true },
             ]);
-            deliver({ type: 'event', url, event: 'a', data: 'back' });
+            deliver({ type: 'event', stream, event: 'a', data: 'back' });
             expect(got).toEqual(['back']);
         });
-        test('rejected: every subscription on the URL hears it, not retrying, and is dropped', () => {
+        test('rejected: every subscription on the stream hears it, not retrying, and is dropped', () => {
             const errors: SubscriptionError[] = [];
             const got: string[] = [];
-            subscriber.subscribe(url, 'a', data => got.push(data), e => errors.push(e));
-
-            deliver({ type: 'rejected', url, status: 403 });
+            subscribe(url, 'a', data => got.push(data), e => errors.push(e));
+ 
+            deliver({ type: 'rejected', stream, status: 403 });
             expect(errors).toEqual([{ message: `${url} answered 403`, status: 403, retrying: false }]);
-            deliver({ type: 'event', url, event: 'a', data: 'late' });
+            deliver({ type: 'event', stream, event: 'a', data: 'late' });
             expect(got).toEqual([]);
         });
-        test('after rejected, a new subscription to the URL subscribes the tab again', () => {
-            const off = subscriber.subscribe(url, 'a', noop, noop);
-            deliver({ type: 'rejected', url, status: 401 });
-            subscriber.subscribe(url, 'a', noop, noop);
+        test('after rejected, a new subscription to the stream subscribes the tab again', () => {
+            const off = subscribe(url, 'a');
+            deliver({ type: 'rejected', stream, status: 401 });
+            subscribe(url, 'a');
             off();   // the dropped one: a no-op, it must not unsubscribe the new one
-            expect(posted).toEqual([{ type: 'subscribe', tab, url }, { type: 'subscribe', tab, url }]);
+            expect(posted.map(m => (m as { type: string }).type)).toEqual(['subscribe', 'subscribe']);
         });
         test('redirect navigates the page', () => {
-            subscriber.subscribe(url, 'a', noop, noop);
-            deliver({ type: 'redirect', url, to: '/login' });
+            subscribe(url, 'a');
+            deliver({ type: 'redirect', stream, to: '/login' });
             expect(page.navigated).toEqual(['/login']);
         });
         test('refresh reloads the page', () => {
-            subscriber.subscribe(url, 'a', noop, noop);
-            deliver({ type: 'refresh', url });
+            subscribe(url, 'a');
+            deliver({ type: 'refresh', stream });
             expect(page.reloads).toBe(1);
         });
-        test('after redirect or refresh, the URL starts over', () => {
-            subscriber.subscribe(url, 'a', noop, noop);
-            deliver({ type: 'refresh', url });
-            subscriber.subscribe(url, 'a', noop, noop);
-            expect(posted).toEqual([{ type: 'subscribe', tab, url }, { type: 'subscribe', tab, url }]);
+        test('after redirect or refresh, the stream starts over', () => {
+            subscribe(url, 'a');
+            deliver({ type: 'refresh', stream });
+            subscribe(url, 'a');
+            expect(posted).toHaveLength(2);
         });
-        test('messages for a URL this tab never used are ignored', () => {
-            deliver({ type: 'event', url, event: 'a', data: 'x' });
-            deliver({ type: 'rejected', url, status: 403 });
+        test('messages for a stream this tab never used are ignored', () => {
+            deliver({ type: 'event', stream, event: 'a', data: 'x' });
+            deliver({ type: 'rejected', stream, status: 403 });
             expect(posted).toEqual([]);
         });
     });
