@@ -1,9 +1,9 @@
 # x-attributes
 
 A small library that adds HTML attributes for server-driven pages, in the spirit of htmx.
-Elements fetch HTML from the server and swap it into the page; Server-Sent Events push
-updates into it. No framework, no virtual DOM, no client-side templates: the server renders
-HTML, the browser inserts it.
+Elements send requests and swap the HTML that comes back into the page; Server-Sent Events
+push updates into it. No framework, no virtual DOM, no client-side templates: the server
+renders HTML, the browser inserts it.
 
 ```html
 <button x-get="/jobs/42" x-target="#details">Show job</button>
@@ -18,13 +18,18 @@ Clicking the button requests `GET /jobs/42` and puts the returned HTML inside `#
 
 - [Loading](#loading)
 - [How it works](#how-it-works)
-- [Attributes](#attributes)
+- [Verbs](#verbs)
   - [x-get](#x-get)
+  - [x-post, x-put, x-patch](#x-post-x-put-x-patch)
+  - [x-delete](#x-delete)
+- [Modifiers](#modifiers)
   - [x-target](#x-target)
   - [x-swap](#x-swap)
   - [x-trigger](#x-trigger)
   - [x-include](#x-include)
   - [x-vals](#x-vals)
+  - [x-headers](#x-headers)
+  - [Which values are sent](#which-values-are-sent)
 - [Responses](#responses)
 - [Server-Sent Events](#server-sent-events)
 - [Events](#events)
@@ -62,20 +67,22 @@ Auto-start only happens for a classic `<script>` tag without `hold`:
 |---|---|
 | `<script src="…">` (with or without `defer`) | yes |
 | `<script src="…" hold>` | no |
-| `<script type="module" src="…">` | no (`document.currentScript` is `null` in modules) |
+| `<script type="module" src="…">` | no (`document.currentScript` is `null` in modules): call `start()` |
 | bundled into your own app | depends on your app's `<script>` tag: call `start()` yourself |
 
-Calling `start()` more than once is harmless: elements that are already wired are skipped.
+If your bundler splits shared code into chunks, its output is an ES module: load it with
+`type="module"` and call `start()`. Calling `start()` more than once is harmless: elements
+that are already wired are skipped.
 
 ---
 
 ## How it works
 
-1. **Start.** `start()` finds every element with an `x-*` verb (`x-get`, …) in `<body>` and
+1. **Start.** `start()` finds every element with a verb (`x-get`, `x-post`, …) in `<body>` and
    wires it once: it reads its `x-trigger` and attaches the listener, timer, observer or
    stream subscription it needs.
-2. **Trigger.** When the trigger fires, the element collects its values, sends the request
-   and waits for HTML.
+2. **Trigger.** When the trigger fires, the element collects its values and headers, sends
+   the request and waits for HTML.
 3. **Swap.** The response is inserted relative to the element's target (`x-target`), the way
    `x-swap` says.
 4. **Re-process.** Only the inserted nodes are scanned for new `x-*` elements, which are
@@ -89,7 +96,29 @@ If your own JavaScript adds or removes `x-*` elements, tell it (see
 
 ---
 
-## Attributes
+## Verbs
+
+A verb says **what request** an element sends, and to which URL. One verb per element; two
+on one element is an error.
+
+| Verb | Method | Values go in | Can use `sse` |
+|---|---|---|---|
+| `x-get` | `GET` | the query string | yes |
+| `x-post` | `POST` | the body (multipart) | no |
+| `x-put` | `PUT` | the body (multipart) | no |
+| `x-patch` | `PATCH` | the body (multipart) | no |
+| `x-delete` | `DELETE` | the query string | no |
+
+What every verb shares:
+
+- **The modifiers below work the same for all of them:** target, swap, trigger, values,
+  headers.
+- **Every request carries** `X-Attr-Request: true` and `Accept: text/html`, so the server can
+  tell it from a page load.
+- **Latest request wins.** If the element fires again before its previous request has
+  finished, the previous one is aborted and ignored.
+- **For links, forms and submit buttons the browser's own navigation is prevented**, so an
+  `href` or `action` only matters without JavaScript.
 
 ### x-get
 
@@ -97,23 +126,75 @@ If your own JavaScript adds or removes `x-*` elements, tell it (see
 <a href="/jobs" x-get="/jobs" x-target="main">Jobs</a>
 ```
 
-Sends `GET <url>` with the element's values as a query string (see
-[Which values are sent](#which-values-are-sent-in-order)), and swaps the response in.
-Every request carries `X-Attr-Request: true` and `Accept: text/html`.
+| Parameter | Meaning |
+|---|---|
+| a URL | the page or fragment to request: `/jobs`, `/jobs?status=open`, `https://…` |
 
-- One verb per element. Two verbs on one element is an error.
-- `x-post`, `x-put`, `x-patch` and `x-delete` are reserved and **not implemented yet**: using
-  them throws.
-- For links, forms and submit buttons the browser's own navigation is prevented, so the
-  `href` or `action` only matters without JavaScript.
-- **Latest request wins.** If the element fires again before its previous request has
-  finished, the previous one is aborted and ignored.
+Sends `GET <url>` with the element's values appended to the query string, and swaps the
+response in. A URL that already has a query keeps it; values are added after.
+
+`x-get` is the only verb that can be a **stream**: with `x-trigger="sse <event>"` the URL is
+an SSE endpoint, and each event's HTML is swapped in. See [Server-Sent Events](#server-sent-events).
+
+### x-post, x-put, x-patch
+
+```html
+<form x-post="/jobs" x-target="#jobs" x-swap="afterbegin">
+    <input name="plate">
+    <input type="file" name="photo">
+    <button>Create</button>
+</form>
+```
+
+| Parameter | Meaning |
+|---|---|
+| a URL | where to send the request |
+
+Sends the values as a **`multipart/form-data` body**, so file inputs work. The URL is used
+as written. These verbs cannot use an `sse` trigger: a stream is a read, and an automatic
+reconnect would repeat the action.
+
+PHP reads the body with `$_POST` / `$_FILES` for POST, and `request_parse_body()` for PUT and
+PATCH.
+
+### x-delete
+
+```html
+<button x-delete="/jobs/42" x-vals="reason=duplicate" x-target="closest li" x-swap="delete">Remove</button>
+```
+
+| Parameter | Meaning |
+|---|---|
+| a URL | the thing to delete |
+
+Sends `DELETE` with the values in the **query string** (some proxies drop DELETE bodies). File
+inputs are an error, as for `x-get`.
+
+---
+
+## Modifiers
+
+Modifiers say **where** the response goes, **how** it is inserted, **when** the request is
+sent, and **what** goes with it. They work with every verb.
+
+| Modifier | Decides | Inherited |
+|---|---|---|
+| `x-target` | where the response goes | yes: nearest one wins |
+| `x-swap` | how it is inserted | yes: nearest one wins |
+| `x-trigger` | when the request is sent | no |
+| `x-include` | values from elsewhere on the page | no |
+| `x-vals` | fixed values | no |
+| `x-headers` | extra request headers | yes: all levels are merged |
+
+**Inherited** means the element uses the attribute from itself or its nearest ancestor that has
+it, so one attribute on a container covers everything inside. `x-headers` goes further: every
+ancestor's headers are combined.
 
 ### x-target
 
 Where the response goes. **Inherited:** the nearest element (itself or an ancestor) with
-`x-target` decides, and relative keywords are resolved from that element.
-Without `x-target` anywhere up the tree, the target is the element itself.
+`x-target` decides, and relative keywords are resolved from that element. Without
+`x-target` anywhere up the tree, the target is the element itself.
 
 | Value | Target |
 |---|---|
@@ -155,7 +236,7 @@ An unknown value is an error, and the page is left unchanged.
 
 ### x-trigger
 
-When the request fires. Read from the element itself, **never inherited**.
+When the request is sent. Read from the element itself, **never inherited**.
 
 | Value | Fires |
 |---|---|
@@ -165,7 +246,7 @@ When the request fires. Read from the element itself, **never inherited**.
 | `load` | once, as soon as the element is wired |
 | `every <time>` | repeatedly, while the element is on the page |
 | `revealed` | once, the first time the element scrolls into view |
-| `sse <event>` | every time the stream at `x-get` sends that event (see [Server-Sent Events](#server-sent-events)) |
+| `sse <event>` | every time the stream at `x-get` sends that event (`x-get` only; see [Server-Sent Events](#server-sent-events)) |
 
 Times need a unit: `300ms` or `2s`. A bare number, an unknown modifier, an empty value, or
 `load`/`revealed` with anything after them are errors, so a typo never becomes a listener
@@ -184,9 +265,11 @@ that silently never fires.
 
 ### x-include
 
-Values to send, from elsewhere on the page. A CSS selector, matched against the whole
-document. Each match must be a `<form>` (all its fields are sent) or a form control (its
-own value is sent).
+Values to send from elsewhere on the page. **Not inherited.**
+
+| Value | Sends |
+|---|---|
+| a CSS selector | every match, from anywhere in the document: a matched `<form>` sends all its fields, a matched control (`input`, `select`, `textarea`, `button`) sends its own value |
 
 ```html
 <form id="filters">
@@ -195,33 +278,67 @@ own value is sent).
 <button x-get="/jobs" x-include="#filters" x-target="#jobs">Apply</button>
 ```
 
+A selector that matches nothing, or matches something that isn't a form or control, is an
+error.
+
 ### x-vals
 
-Fixed values. They replace every value with the same name from the other sources.
-Two formats; the value starts with `{` → JSON, otherwise a query string:
+Fixed values. **Not inherited.** They replace every value with the same name from the other
+sources.
+
+| Value | Format |
+|---|---|
+| a query string | `status=open&page=2&s[]=3&s[]=7`: repeated names allowed, percent-encoded |
+| a JSON object (starts with `{`) | `{"status": "open", "page": 2}`: flat, strings, numbers and booleans only |
 
 ```html
-<!-- query string: repeated names allowed -->
-<button x-get="/jobs" x-vals="status=open&page=2&s[]=3&s[]=7">Open jobs</button>
-
-<!-- flat JSON object of strings, numbers and booleans -->
+<button x-get="/jobs" x-vals="status=open&page=2">Open jobs</button>
 <button x-get="/jobs" x-vals='{"status": "open", "page": 2}'>Open jobs</button>
 ```
 
-From PHP, build the query-string form with
-`htmlspecialchars(http_build_query([...]))`: values are percent-encoded and the attribute stays
-valid. In JSON, invalid JSON, a non-object, or nested/`null` values are errors; a name can
-appear only once.
+From PHP, build the query-string form with `htmlspecialchars(http_build_query([...]))`: values
+are percent-encoded and the attribute stays valid. In JSON, invalid JSON or nested/`null` values
+are errors, and a name can appear only once.
 
-#### Which values are sent, in order
+### x-headers
+
+Extra request headers. **Inherited and merged:** every ancestor's `x-headers`, from the
+outermost down to the element, are combined; a closer one replaces a farther one with the same
+name (names compare without case).
+
+| Value | Format |
+|---|---|
+| a query string | `X-Csrf-Token=abc&X-Tenant=7` |
+| a JSON object (starts with `{`) | `{"X-Tenant": 7}` |
+| `Name=` (empty value) | removes a header set by an ancestor |
+
+```html
+<body x-headers="X-Csrf-Token=<?= $csrf ?>&X-Tenant=7">
+    <button x-post="/jobs/42/close">Close</button>                       <!-- both headers -->
+    <button x-post="/jobs/42/note" x-headers="X-Tenant=9">Note</button>  <!-- token, X-Tenant: 9 -->
+    <ul x-get="/live" x-trigger="sse jobs:new" x-headers="X-Csrf-Token="></ul>  <!-- X-Tenant only -->
+</body>
+```
+
+- Sent with **every verb**, read each time a request fires. CSRF tokens go here: one
+  `x-headers` on `<body>` covers the whole page.
+- On a **stream** they are read once, when the element subscribes, and become part of the
+  connection's identity: elements with different headers get separate connections. Keep
+  per-render values (a fresh CSRF token in a fragment) off streams with `Name=`.
+- **Errors:** a reserved name (`Accept`, `Content-Type`, `X-Attr-Request`, `Last-Event-ID`,
+  which the library sets itself), an invalid header name, or the same name twice in one
+  attribute.
+
+### Which values are sent
 
 1. the enclosing `<form>`'s fields, or, outside a form, the element's own `name`/`value`;
-2. everything matched by `x-include`;
+2. everything matched by `x-include`, added after 1 (a name in both is sent twice);
 3. `x-vals`, replacing every value of a name it shares with 1 or 2.
 
 Browser form rules apply: disabled and unnamed controls and unchecked checkboxes/radios are
-skipped; multi-selects and repeated names (`status[]`) give several values. File inputs are
-an error with `x-get`, since files can't go in a query string.
+skipped; multi-selects and repeated names (`status[]`) give several values; a checked
+checkbox without a `value` sends `on`. Files are sent by POST, PUT and PATCH, and are an error
+for GET and DELETE, which can't put them in a query string.
 
 ---
 
@@ -238,7 +355,7 @@ an error with `x-get`, since files can't go in a query string.
 If the element was removed from the page while the request was in flight, the response is
 ignored.
 
-**Respond with fragments.** A request from `x-get` wants only the HTML that goes into the
+**Respond with fragments.** A request from the library wants only the HTML that goes into the
 target, not a full page. Return exactly the markup to insert.
 
 **Send `X-Attr-Redirect` to library requests, `302` to page loads.** Middleware that redirects
@@ -284,13 +401,18 @@ data:
 - Each message's `data` is HTML, swapped in with the element's `x-target` and `x-swap` and then
   wired, like a response. Several `data:` lines are joined with newlines.
 - Empty `data` with `outerHTML` removes the element.
-- Elements with the same URL **share one connection**. Messages are routed by event name.
-  The connection opens with the first element and closes when the last one is gone.
-- `x-include` and `x-vals` are read **once**, when the element is wired, and become the stream
-  URL's query string. Changing them later does nothing. Elements whose values differ get
-  different URLs, and so separate connections.
-- An element replaced by `outerHTML` with an element listening on the same URL keeps the
+- Elements with the same URL and headers **share one connection**; messages are routed by
+  event name. The connection opens with the first element and closes when the last one is gone.
+- `x-include`, `x-vals` and `x-headers` are read **once**, when the element is wired. Values
+  become the stream URL's query string. Changing them later does nothing.
+- An element replaced by `outerHTML` with an element listening on the same stream keeps the
   connection: it isn't closed and reopened.
+- One broken element (a target that matches nothing, say) reports its error without breaking
+  the stream for the others.
+
+**Put in the URL only what defines the stream** (`?status=open`, `?format=html`), never values
+specific to one page load: those make every tab and fragment a different URL, so nothing is
+shared.
 
 ### Connection behaviour
 
@@ -304,7 +426,8 @@ data:
 | `event: x-attr:refresh` | reloads the page; stops |
 
 The `x-attr:redirect` and `x-attr:refresh` event names are reserved and never reach elements.
-Stream connects carry `Accept: text/event-stream` and `X-Attr-Request: true`.
+Stream connects carry `Accept: text/event-stream`, `X-Attr-Request: true` and the element's
+`x-headers`.
 
 ### Not missing anything: Last-Event-ID
 
@@ -405,10 +528,10 @@ next timer tick, observer callback or stream message.
 Mistakes in the markup throw an `Error` when the element is wired or fires, with the
 offending value in the message, instead of silently doing nothing:
 
-- two verbs on one element, or a verb that isn't implemented yet;
-- an invalid `x-trigger`, `x-swap` or `x-vals`;
+- two verbs on one element, or an `sse` trigger on a verb other than `x-get`;
+- an invalid `x-trigger`, `x-swap`, `x-vals` or `x-headers`;
 - an `x-target` or `x-include` that matches nothing;
-- a file input in an `x-get` request (files can't go in a query string).
+- a file input in a GET or DELETE request (files can't go in a query string).
 
 An error in one element wired from a stream message is reported (thrown asynchronously, so
 it appears in the console) without breaking the stream for other elements.
@@ -425,6 +548,10 @@ bun run test        # unit tests (happy-dom)
 bun run typecheck   # tsc -b
 bun run build       # tsdown → dist/
 ```
+
+Run `typecheck` along with the tests: some mistakes (a missing argument that shifts the others,
+a missing field in an object) compile into code that runs but misbehaves, and only the type
+checker reports them where they are.
 
 - Tests live **in the source files**, below a `// ---- tests (removed from the build) ----`
   line. They use globals (`test`, `describe`, `expect`, `beforeEach`, `afterEach`), never an
@@ -448,8 +575,8 @@ bun run build       # tsdown → dist/
 
 | Folder | Holds |
 |---|---|
-| `handlers/` | one wiring function per verb (`get.ts`, …) |
+| `handlers/` | one wiring function per verb: `get.ts` (with streams), `send.ts` (POST, PUT, PATCH, DELETE) |
 | `fire/` | shared by every verb: `request.ts` (build, send, handle the response) and `bind.ts` (carry out `x-trigger`) |
-| `modifiers/` | the attribute readers: target, swap, trigger, include, vals |
-| `shared/` | building blocks with no dependencies outside `shared/`: values, form reading, cleanup, headers, events |
+| `modifiers/` | the attribute readers: target, swap, trigger, include, vals, headers |
+| `shared/` | building blocks with no dependencies outside `shared/`: values, form reading, the `x-vals`/`x-headers` parser, cleanup, header and event names |
 | `sse/` | `parse.ts` (wire format), `stream.ts` (one connection, page-free), `transport.ts` (messages), `broker.ts` (owns connections), `subscriber.ts` (the tab side), `index.ts` (wires them, lazily) |
